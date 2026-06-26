@@ -255,6 +255,10 @@ def cmd_init(args: argparse.Namespace) -> int:
         _emit_error(args, f"project root does not exist: {root}")
         return 2
 
+    if not root.is_dir():
+        _emit_error(args, f"project root is not a directory: {root}")
+        return 2
+
     if memory_dir.exists() and not args.force:
         _emit_error(
             args,
@@ -273,17 +277,28 @@ def cmd_init(args: argparse.Namespace) -> int:
     # Non-git detection (notice only; gitignore is still written for later git init).
     git_present = is_git_repo(root)
 
-    # Build the scaffold.
-    if memory_dir.exists() and args.force:
-        shutil.rmtree(memory_dir)
-    copy_template_tree(memory_dir)
-
+    # Build the new scaffold in a staging dir and swap it in. An existing store
+    # (--force) is destroyed only after the replacement is fully built, so a
+    # missing template or a mid-build failure can never leave the project with a
+    # half-written or deleted .project-memory/.
     project = derive_project_name(root)
     created_at = now_iso()
-    (memory_dir / "manifest.yml").write_text(
-        manifest_content(project, created_at, session_tracking, commit_generated),
-        encoding="utf-8",
-    )
+    staging = root / (MEMORY_DIRNAME + ".new")
+    if staging.exists():
+        shutil.rmtree(staging)
+    try:
+        copy_template_tree(staging)
+        (staging / "manifest.yml").write_text(
+            manifest_content(project, created_at, session_tracking, commit_generated),
+            encoding="utf-8",
+        )
+    except Exception:
+        if staging.exists():
+            shutil.rmtree(staging)
+        raise
+    if memory_dir.exists():
+        shutil.rmtree(memory_dir)
+    staging.rename(memory_dir)
 
     block = gitignore_block(session_tracking, commit_generated)
     write_gitignore(root, block)
@@ -3730,7 +3745,14 @@ def main(argv: list[str] | None = None) -> int:
     if not getattr(args, "command", None):
         parser.print_help()
         return 0
-    return args.func(args)
+    try:
+        return args.func(args)
+    except (OSError, ValueError) as exc:
+        # Expected, user-facing failures (missing template/package, permissions,
+        # unrepresentable values) surface as a clean error + nonzero exit rather
+        # than a raw traceback. Programming errors still propagate.
+        _emit_error(args, str(exc))
+        return 1
 
 
 if __name__ == "__main__":

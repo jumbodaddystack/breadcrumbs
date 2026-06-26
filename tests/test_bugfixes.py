@@ -283,5 +283,45 @@ class ResumePacketTests(unittest.TestCase):
         self.assertNotIn("omitted", md)
 
 
+# --------------------------------------------------------------------------- #
+# Group 7 — init / main robustness
+# --------------------------------------------------------------------------- #
+from unittest import mock  # noqa: E402
+
+import breadcrumbs.cli as _cli  # noqa: E402
+
+
+class InitMainRobustnessTests(unittest.TestCase):
+    def test_M11a_file_as_project_root_is_clean_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "afile"
+            f.write_text("x")
+            rc = crumb.main(["init", "--project", str(f)])  # must not traceback
+            self.assertEqual(rc, 2)
+
+    def test_M11b_missing_template_is_clean_error_not_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch.object(_cli, "TEMPLATE_DIR", Path("/no/such/templates")):
+                rc = crumb.main(["init", "--project", str(root),
+                                 "--session-tracking", "full"])  # must not raise
+            self.assertNotEqual(rc, 0)
+
+    def test_H3_force_preserves_store_when_rebuild_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            crumb.main(["init", "--project", str(root), "--session-tracking", "full"])
+            mem = root / crumb.MEMORY_DIRNAME
+            precious = mem / "decisions" / "2026-06-25-precious.md"
+            precious.write_text("important\n", encoding="utf-8")
+            # Template unavailable: a --force rebuild must NOT destroy the store.
+            with mock.patch.object(_cli, "TEMPLATE_DIR", Path("/no/such/templates")):
+                rc = crumb.main(["init", "--project", str(root), "--force",
+                                 "--session-tracking", "full"])
+            self.assertNotEqual(rc, 0)
+            self.assertTrue(precious.exists(), "existing store must survive a failed rebuild")
+            self.assertEqual(precious.read_text(), "important\n")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
