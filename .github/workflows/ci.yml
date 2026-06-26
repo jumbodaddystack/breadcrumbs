@@ -127,7 +127,7 @@ jobs:
 
       - name: Bundled templates present in the wheel (17 files incl. 4 .gitkeep)
         run: |
-          WHEEL="$(ls dist/breadcrumbs-*.whl)"
+          WHEEL="$(ls dist/crumb_kit-*.whl)"
           echo "wheel: $WHEEL"
           n_tmpl="$(python -m zipfile -l "$WHEEL" | grep -c 'breadcrumbs/templates/project-memory/')"
           n_keep="$(python -m zipfile -l "$WHEEL" | grep -c '\.gitkeep')"
@@ -138,7 +138,7 @@ jobs:
       - name: Install the built wheel into an isolated venv (mimics pipx)
         run: |
           python -m venv /tmp/cv
-          /tmp/cv/bin/python -m pip install "$(ls dist/breadcrumbs-*.whl)"
+          /tmp/cv/bin/python -m pip install "$(ls dist/crumb_kit-*.whl)"
 
       - name: Console script + version on PATH
         run: |

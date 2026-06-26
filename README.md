@@ -17,7 +17,8 @@ project's `.project-memory/` directory, so humans and agents can resume work acr
 sessions, tools, devices, branches, and time without re-discovering decisions,
 repeating failed attempts, or trusting stale context.
 
-- **Package / repo name:** `breadcrumbs`
+- **PyPI package name:** `crumb-kit` (`pip install crumb-kit`)
+- **Import package / GitHub repo:** `breadcrumbs`
 - **CLI binary name:** `crumb`
 - **Formal capability name:** Project Continuity Memory
 
@@ -52,7 +53,7 @@ is [`pipx`](https://pipx.pypa.io/), which puts the CLI on your PATH in its own
 isolated environment:
 
 ```bash
-pipx install breadcrumbs          # from a published artifact (future)
+pipx install crumb-kit          # from a published artifact (future)
 pipx install .                       # from a source checkout (this repo dir)
 ```
 
@@ -301,7 +302,7 @@ regenerated; `audit` flags this drift by comparing the packet's stamped
 With Phase 6 the full MVP (capture → resume → trust) is complete and CI-guarded;
 Phase 7 packages it as a `pipx`-installable `crumb` binary (see **Install**
 above). Phase 8 adds an **optional** MCP server (`pip install
-"breadcrumbs[mcp]"`) that exposes the same memory engine to agents without
+"crumb-kit[mcp]"`) that exposes the same memory engine to agents without
 shelling out — a thin wrapper over the Phase 1–6 functions, never required for
 baseline use. See [`docs/`](docs/) for the architecture, record schema, CLI spec,
 [MCP spec](docs/mcp-spec.md), and security posture.

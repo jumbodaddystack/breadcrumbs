@@ -19,7 +19,7 @@ and every MCP capability has a manual CLI / plain-file equivalent.
 The SDK is an **optional extra** (the core package stays standard-library-only):
 
 ```bash
-pip install "breadcrumbs[mcp]"     # adds the `mcp` SDK (needs Python >=3.10)
+pip install "crumb-kit[mcp]"     # adds the `mcp` SDK (needs Python >=3.10)
 ```
 
 Run the server (stdio transport):
