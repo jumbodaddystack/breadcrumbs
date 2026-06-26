@@ -254,5 +254,34 @@ class CaptureHandoffTests(unittest.TestCase):
         self.assertTrue(crumb._is_placeholder("<describe the current focus>"))
 
 
+# --------------------------------------------------------------------------- #
+# Group 6 — resume packet disclosure
+# --------------------------------------------------------------------------- #
+class ResumePacketTests(unittest.TestCase):
+    def _packet(self, **over):
+        p = {
+            "source": {"commit": "abc", "inputs_hash": "h", "generated_at": "t"},
+            "project": {"name": "p", "path": "/p", "branch": "main",
+                        "commit": "abc", "dirty_state": "clean"},
+            "current_focus": "", "next_action": "", "fast": False,
+            "active_decisions": [], "failed_attempts": [], "known_traps": [],
+            "open_questions": [], "likely_files": [], "verification": [],
+            "warnings": [], "omitted": {},
+        }
+        p.update(over)
+        return p
+
+    def test_M8_omitted_note_shown_when_section_fully_trimmed(self):
+        packet = self._packet(verification=[], omitted={"verification": 3})
+        md = crumb.render_packet_markdown(packet)
+        # the section is empty but 3 were trimmed — the disclosure must survive
+        self.assertIn("3 more omitted", md)
+
+    def test_M8_no_spurious_note_when_nothing_omitted(self):
+        packet = self._packet(verification=[], omitted={})
+        md = crumb.render_packet_markdown(packet)
+        self.assertNotIn("omitted", md)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

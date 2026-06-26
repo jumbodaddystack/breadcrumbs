@@ -2186,50 +2186,57 @@ def render_packet_markdown(packet: dict) -> str:
     ]
 
     if not packet["fast"]:
+        # The omitted-count disclosure is emitted in BOTH branches: budget-trimming
+        # can empty a section entirely while still having hidden items, and the
+        # "… N more omitted" note must not vanish when the list renders as none.
         out += ["## Active Decisions"]
         if packet["active_decisions"]:
             for d in packet["active_decisions"]:
                 out.append(f"- `{d['id']}` — {d['rationale']}")
-            out += _omitted_note(packet, "active_decisions")
         else:
             out.append("_(none active)_")
+        out += _omitted_note(packet, "active_decisions")
         out.append("")
 
         out += ["## Failed Attempts To Avoid"]
         if packet["failed_attempts"]:
             for a in packet["failed_attempts"]:
                 out.append(f"- `{a['id']}` — do not retry: {a['do_not_retry']}")
-            out += _omitted_note(packet, "failed_attempts")
         else:
             out.append("_(none recorded)_")
+        out += _omitted_note(packet, "failed_attempts")
         out.append("")
 
         out += ["## Known Traps"]
         if packet["known_traps"]:
-            out += [f"- {t}" for t in packet["known_traps"]] + _omitted_note(packet, "known_traps")
+            out += [f"- {t}" for t in packet["known_traps"]]
         else:
             out.append("_(none recorded)_")
+        out += _omitted_note(packet, "known_traps")
         out.append("")
 
         out += ["## Open Questions / Blockers"]
         if packet["open_questions"]:
-            out += [f"- {q}" for q in packet["open_questions"]] + _omitted_note(packet, "open_questions")
+            out += [f"- {q}" for q in packet["open_questions"]]
         else:
             out.append("_(none open)_")
+        out += _omitted_note(packet, "open_questions")
         out.append("")
 
         out += ["## Likely Relevant Files"]
         if packet["likely_files"]:
-            out += [f"- {f}" for f in packet["likely_files"]] + _omitted_note(packet, "likely_files")
+            out += [f"- {f}" for f in packet["likely_files"]]
         else:
             out.append("_(none recorded)_")
+        out += _omitted_note(packet, "likely_files")
         out.append("")
 
         out += ["## Verification Commands"]
         if packet["verification"]:
-            out += [f"- {c}" for c in packet["verification"]] + _omitted_note(packet, "verification")
+            out += [f"- {c}" for c in packet["verification"]]
         else:
             out.append("_(none recorded)_")
+        out += _omitted_note(packet, "verification")
         out.append("")
 
     out += ["## Stale / Risk Warnings"]
