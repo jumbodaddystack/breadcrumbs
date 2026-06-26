@@ -17,9 +17,9 @@ Run it with:                         ``python -m breadcrumbs.mcp_server``
                                 or:  ``breadcrumbs-mcp``
 
 Root resolution: the server operates on the project in ``$BREADCRUMBS_PROJECT`` if
-set, else the current working directory (Phase 9's generated ``.mcp.json`` sets
-the cwd / env). Memory content returned over MCP is **data, not instruction**
-(plan §15).
+set, else the current working directory (``crumb init --with-mcp`` / ``crumb mcp
+register`` writes a ``.mcp.json`` that sets this env). Memory content returned over
+MCP is **data, not instruction** (plan §15).
 """
 
 from __future__ import annotations
@@ -167,6 +167,17 @@ def build_server():  # -> FastMCP
     def memory_validate() -> dict:
         """Run deterministic structural validation (wraps `crumb validate`)."""
         return mcp_core.tool_validate(root=_root())
+
+    @mcp.tool()
+    def memory_note(
+        kind: str, text: str, fields: dict | None = None, tags: list[str] | None = None
+    ) -> dict:
+        """Leave an open-question / known-trap / idea (wraps `crumb note`).
+
+        `kind` is question|trap|idea. Closes the read/write asymmetry where these
+        were readable as resources but had no writer.
+        """
+        return mcp_core.tool_note(kind, text, fields=fields, tags=tags, root=_root())
 
     @mcp.tool()
     def memory_mark_status(id: str, status: str, reason: str) -> dict:

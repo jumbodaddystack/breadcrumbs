@@ -30,8 +30,9 @@ python -m breadcrumbs.mcp_server    # equivalent module form
 ```
 
 **Root resolution.** The server operates on the project in `$BREADCRUMBS_PROJECT`
-if set, otherwise the current working directory. Phase 9's generated `.mcp.json`
-sets the working directory / env (see [Handoff](#handoff-to-phase-9)).
+if set, otherwise the current working directory. `crumb init --with-mcp` (or
+`crumb mcp register`) writes a `.mcp.json` that sets this env (see
+[Registration](#registration)).
 
 **Graceful degradation.** If the `mcp` SDK is not installed, importing
 `breadcrumbs.mcp_server` still succeeds; `build_server()` raises a clear
@@ -71,17 +72,28 @@ unknown `{id}` raises (surfaced to the client as a resource error). A missing
 Prompts return guidance text only. They carry **no authority** over the user's
 current instruction, the code, the tests, or authoritative docs (plan §15).
 
-## Tools (7) — wrap existing functions
+## Tools (8) — wrap existing functions
 
 | Tool | Signature | Wraps | Output |
 |---|---|---|---|
 | `memory_search` | `(query, filters?)` | `cli.search` | `{query, filters, count, matches[]}` |
 | `memory_record` | `(type, payload)` | `cli.write_record` + validate gate | `{ok, id, type, path, confidence}` or `{ok:false, error}` |
+| `memory_note` | `(kind, text, fields?, tags?)` | `cli.note` | `{ok, kind, ref|id, path}` or `{ok:false, error}` |
 | `memory_guard_before_action` | `(action, files?)` | `cli.guard` | the full guard result (`{verdict, matches, history, staleness, next_action, …}`) |
 | `memory_build_resume_packet` | `(task?)` | `cli.build_resume_packet` | the structured packet dict (with optional echoed `requested_task`) |
 | `memory_validate` | `()` | `cli.run_validate` | `{ok, fail_count, findings[]}` |
 | `memory_mark_status` | `(id, status, reason)` | `cli.set_record_status` | `{ok, id, from, to, path}` or `{ok:false, error}` |
 | `memory_scan_secrets` | `()` | `cli.scan_secrets` | `{clean, count, findings[]}` (pattern names + locations only) |
+
+### `memory_note`
+
+Write-surface for the three record kinds that have no `memory_record` type:
+`kind` is `"question"`, `"trap"`, or `"idea"`. `fields` mirrors the `crumb note`
+flags per kind (question: `why`/`needs`/`status`; trap: `slug`/`area`/`symptom`/
+`why`/`safe`/`verify`; idea: `sections{heading:text}`). question/trap append a
+parse-verified block to the singleton file; idea passes the same validate gate as
+`memory_record`. Each call refreshes `generated/resume-packet.md`. Invalid writes
+are reverted.
 
 ### `memory_record` payload
 
@@ -138,17 +150,20 @@ rejected (§16.6) and reverted. Use the supersede flow for replacements.
 
 ---
 
-## Handoff to Phase 9
+## Registration
 
-Phase 9 generates an opt-in, reviewable `.mcp.json` pointing at this server.
-Invocation command for that config:
+`crumb init --with-mcp` (or the standalone `crumb mcp register`) merges an
+opt-in, reviewable entry into the project `.mcp.json`, preserving any other
+servers:
 
 ```jsonc
 {
   "mcpServers": {
     "breadcrumbs": {
+      "type": "stdio",
       "command": "breadcrumbs-mcp",
-      "env": { "BREADCRUMBS_PROJECT": "${workspaceFolder}" }
+      "args": [],
+      "env": { "BREADCRUMBS_PROJECT": "${CLAUDE_PROJECT_DIR:-.}" }
     }
   }
 }
@@ -157,4 +172,6 @@ Invocation command for that config:
 Equivalently `python -m breadcrumbs.mcp_server`. The server requires the
 `[mcp]` extra to be installed; without it the command exits non-zero with an
 install hint (graceful degradation), so a missing optional dependency never
-breaks a project that opts into the generated config.
+breaks a project that opts into the registration. `crumb doctor` reports whether
+the entry is present and whether the `[mcp]` extra is importable. Remove the
+entry with `crumb init --remove-integrations`.

@@ -268,6 +268,30 @@ def tool_record(
     }
 
 
+def tool_note(
+    kind: str,
+    text: str,
+    fields: dict | None = None,
+    tags: list[str] | None = None,
+    root: str | Path | None = None,
+) -> dict:
+    """`memory_note` — wraps `cli.note` (review §6.6 write-surface).
+
+    Writes an open-question / known-trap / idea and refreshes the resume packet.
+    `kind` is one of question|trap|idea. `fields` mirrors the CLI flags per kind
+    (question: why/needs/status; trap: slug/area/symptom/why/safe/verify; idea:
+    sections{heading:text}). Invalid writes are reverted, exactly like the CLI.
+    """
+    project_root, mem = resolve(root)
+    _require_memory(mem)
+    if kind not in cli.NOTE_KINDS:
+        return {"ok": False, "error": f"kind must be one of {', '.join(cli.NOTE_KINDS)}"}
+    return cli.note(
+        mem, project_root, kind, text or "",
+        fields=fields or {}, tags=tags or [], agent="agent",
+    )
+
+
 def tool_mark_status(
     id: str,
     status: str,

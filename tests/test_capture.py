@@ -66,7 +66,10 @@ class CapturePrefillTests(unittest.TestCase):
             _, body = crumb.parse_frontmatter(path.read_text())
             rec = crumb.Record(path, "session", {}, body)
             self.assertIn("add g.txt feature", rec.sections["Work Completed"])
-            self.assertIn("g.txt", rec.sections["Files Touched"])
+            # Files Touched is a counts-only summary, not an inlined per-file --stat
+            # (review §6.1): the path itself must not appear in the committed record.
+            self.assertIn("files changed", rec.sections["Files Touched"])
+            self.assertNotIn("g.txt", rec.sections["Files Touched"])
             self.assertEqual(rec.sections["Next Action"], "wire resume")
             self.assertEqual([f for f in crumb.run_validate(mem) if f["status"] == "fail"], [])
 
@@ -98,6 +101,24 @@ class CapturePrefillTests(unittest.TestCase):
             self.assertEqual([f for f in crumb.run_validate(mem) if f["status"] == "fail"], [])
             current = (mem / "current.md").read_text()
             self.assertIn("phase 3", current)
+
+
+class DiffStatSummaryTests(unittest.TestCase):
+    def test_summarizes_counts(self):
+        self.assertEqual(
+            crumb._summarize_diffstat(" 93 files changed, 1200 insertions(+), 56 deletions(-)"),
+            "93 files changed, +1200/-56",
+        )
+
+    def test_singular_and_partial(self):
+        self.assertEqual(
+            crumb._summarize_diffstat(" 1 file changed, 2 insertions(+)"),
+            "1 files changed, +2/-0",
+        )
+
+    def test_empty_means_no_changes(self):
+        self.assertEqual(crumb._summarize_diffstat(""), "_(no file changes detected)_")
+        self.assertEqual(crumb._summarize_diffstat(None), "_(no file changes detected)_")
 
 
 class CaptureFastTests(unittest.TestCase):

@@ -21,7 +21,9 @@ Design constraints (see docs/ and the build plan):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import io
 import json
 import math
 import os
@@ -187,32 +189,78 @@ def gitignore_block(session_tracking: str, commit_generated: bool) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_gitignore(root: Path, block: str) -> None:
-    """Insert/replace the breadcrumbs-managed block in the project .gitignore.
+def rewrite_managed_block(
+    path: Path, begin: str, end: str, block: str | None
+) -> None:
+    """Insert, replace, or remove a fenced managed block in a text file.
 
-    Idempotent: re-running init rewrites only the managed block and leaves any
-    user content intact.
+    Idempotent. `block` (when given) must contain the `begin` and `end` marker
+    lines; only the region between the markers is rewritten, so surrounding user
+    content is preserved. Pass `block=None` (or "") to strip the managed block,
+    leaving everything else intact. The comment style lives in the markers, so the
+    same surgery works for `.gitignore` (`#`) and Markdown adapters (`<!-- -->`).
     """
-    path = root / ".gitignore"
-    if path.exists():
-        existing = path.read_text(encoding="utf-8")
-    else:
-        existing = ""
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
 
-    if GITIGNORE_BEGIN in existing and GITIGNORE_END in existing:
-        head, _, rest = existing.partition(GITIGNORE_BEGIN)
-        _, _, tail = rest.partition(GITIGNORE_END)
+    if begin in existing and end in existing:
+        head, _, rest = existing.partition(begin)
+        _, _, tail = rest.partition(end)
         # tail starts right after the END marker; drop a leading newline if present
         tail = tail[1:] if tail.startswith("\n") else tail
-        new_content = head.rstrip("\n")
-        new_content = (new_content + "\n\n") if new_content else ""
-        new_content += block + (tail if tail.strip() else "")
+        head = head.rstrip("\n")
+        if not block:
+            # Removal: stitch head and tail back together without the block.
+            if head and tail.strip():
+                new_content = head + "\n\n" + tail.lstrip("\n")
+            elif head:
+                new_content = head + "\n"
+            else:
+                new_content = tail.lstrip("\n")
+        else:
+            prefix = (head + "\n\n") if head else ""
+            new_content = prefix + block + (tail if tail.strip() else "")
     else:
+        if not block:
+            return  # nothing to remove
         sep = "" if (not existing or existing.endswith("\n")) else "\n"
         prefix = (existing + sep + "\n") if existing.strip() else ""
         new_content = prefix + block
 
     path.write_text(new_content, encoding="utf-8")
+
+
+def write_gitignore(root: Path, block: str) -> None:
+    """Insert/replace the breadcrumbs-managed block in the project .gitignore.
+
+    Idempotent: re-running init rewrites only the managed block and leaves any
+    user content intact. Thin wrapper over `rewrite_managed_block`.
+    """
+    rewrite_managed_block(root / ".gitignore", GITIGNORE_BEGIN, GITIGNORE_END, block)
+
+
+def merge_json_file(path: Path, mutate) -> None:
+    """Load a JSON object (or {} if absent/empty), apply `mutate` in place, write back.
+
+    Used for `.mcp.json` and `.claude/settings.json`, which cannot carry comment
+    markers. Sibling keys are preserved; output is 2-space-indented with a trailing
+    newline. Raises ValueError on unparseable or non-object JSON rather than
+    clobbering a file we do not understand.
+    """
+    if path.exists():
+        text = path.read_text(encoding="utf-8")
+        try:
+            data = json.loads(text) if text.strip() else {}
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"cannot parse JSON at {path}: {exc}") from exc
+    else:
+        data = {}
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"expected a JSON object at {path}, found {type(data).__name__}"
+        )
+    mutate(data)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
 # --------------------------------------------------------------------------- #
@@ -259,6 +307,34 @@ def cmd_init(args: argparse.Namespace) -> int:
         _emit_error(args, f"project root is not a directory: {root}")
         return 2
 
+    # Standalone integration operations: they act on an existing project and never
+    # scaffold, so they run before the "store already exists" guard below.
+    if getattr(args, "remove_integrations", False):
+        removed = remove_integrations(root)
+        if args.json:
+            print(json.dumps({"removed": removed}, indent=2))
+        else:
+            touched = removed["adapters"] or removed["mcp"] or removed["hooks"]
+            print("Removed breadcrumbs integrations:" if touched else "No integrations to remove.")
+            if removed["adapters"]:
+                print(f"  adapter blocks: {', '.join(removed['adapters'])}")
+            if removed["mcp"]:
+                print("  .mcp.json: breadcrumbs server entry removed")
+            if removed["hooks"]:
+                print("  .claude/settings.json: crumb hooks removed")
+        return 0
+
+    if getattr(args, "print_integrations", False):
+        plan = resolve_integration_plan(root, args)
+        if args.json:
+            print(json.dumps({"would_apply": plan}, indent=2))
+        else:
+            print("Integrations that would be applied:")
+            print(f"  adapter signpost -> {', '.join(plan['adapters']) or '(none)'}")
+            print(f"  MCP register     -> {'yes' if plan['mcp'] else 'no'}")
+            print(f"  Claude hooks     -> {', '.join(plan['hooks']) or '(none)'}")
+        return 0
+
     if memory_dir.exists() and not args.force:
         _emit_error(
             args,
@@ -303,6 +379,12 @@ def cmd_init(args: argparse.Namespace) -> int:
     block = gitignore_block(session_tracking, commit_generated)
     write_gitignore(root, block)
 
+    # Bootstrap agent integrations (review §5/§7). Resolution prompts on a TTY when
+    # unspecified and is a silent no-op non-interactively, so default `crumb init`
+    # behavior is unchanged. Every edit is fenced/reversible (`--remove-integrations`).
+    plan = resolve_integration_plan(root, args)
+    applied = apply_integrations(root, plan)
+
     summary = {
         "created": str(memory_dir),
         "project": project,
@@ -312,6 +394,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         "commit_generated_projections": commit_generated,
         "gitignore": str(root / ".gitignore"),
         "git_repo": git_present,
+        "integrations": applied,
     }
     if not git_present:
         summary["git_notice"] = (
@@ -333,10 +416,21 @@ def _emit_init_summary(args: argparse.Namespace, summary: dict) -> None:
     print(f"  session_tracking:              {summary['session_tracking']}")
     print(f"  commit_generated_projections:  {summary['commit_generated_projections']}")
     print(f"  .gitignore:                    {summary['gitignore']}")
+    integ = summary.get("integrations") or {}
+    if integ.get("adapters") or integ.get("mcp") or integ.get("hooks"):
+        print("  integrations:")
+        if integ.get("adapters"):
+            print(f"    adapter signpost:            {', '.join(integ['adapters'])}")
+        if integ.get("mcp"):
+            print(f"    MCP registered:              {integ['mcp']}")
+        if integ.get("hooks"):
+            print(f"    Claude hooks:                {', '.join(integ['hooks'])}")
+    else:
+        print("\n" + FIRST_RUN_NUDGE)
     if not summary["git_repo"]:
         print(f"\nNotice: {summary['git_notice']}")
     if args.verbose:
-        print("\nNext: `crumb remember decision` / `crumb capture session` (planned).")
+        print("\nNext: `crumb resume` to load context; `crumb doctor` to check wiring.")
 
 
 def _emit_error(args: argparse.Namespace, message: str) -> None:
@@ -1009,7 +1103,27 @@ BODY_SECTIONS = {
         "Commands / Verification",
         "Next Action",
     ],
+    # Ideas are speculative proposals (review §6.6 write-surface). Kept lean so
+    # `crumb note idea` stays low-friction; not subject to the §16.9 evidence rule.
+    "idea": [
+        "Idea",
+        "Motivation",
+        "Sketch",
+        "Open Questions",
+    ],
 }
+
+# Named flags for the fixed attempt section vocabulary (review §6.2/§8): expose the
+# contract in `--help` so it is no longer discoverable only by rejection. Each maps a
+# Namespace attribute (from `--problem`, `--do-not-retry`, …) to its canonical heading.
+ATTEMPT_FLAG_SECTIONS = (
+    ("problem", "Problem"),
+    ("tried", "Tried"),
+    ("result", "Result"),
+    ("why", "Why It Failed / Succeeded"),
+    ("do_not_retry", "Do Not Retry Unless"),
+    ("related", "Related Records"),
+)
 
 # Frontmatter key order for rendered records (mirrors §7).
 FRONTMATTER_ORDER = [
@@ -1339,6 +1453,11 @@ def cmd_remember(args: argparse.Namespace) -> int:
     except ValueError as exc:
         _emit_error(args, str(exc))
         return 2
+    # Named attempt flags (--problem/--tried/…) override any matching --set heading.
+    for attr, heading in ATTEMPT_FLAG_SECTIONS:
+        val = getattr(args, attr, None)
+        if val is not None:
+            sections[heading] = val
     evidence = _parse_evidence_pairs(args.evidence)
     tags = _split_tags(args.tags)
     confidence = args.confidence
@@ -1421,6 +1540,277 @@ def cmd_remember(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---- schema introspection (review §6.2/§8) --------------------------------- #
+
+def record_schema() -> dict:
+    """The full record-contract as data, so an agent reads it once (review §6.2).
+
+    Pure projection of the existing contract constants — no memory dir required.
+    """
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "record_types": {
+            rtype: {"body_sections": list(sections)}
+            for rtype, sections in BODY_SECTIONS.items()
+        },
+        "required_frontmatter_keys": list(REQUIRED_RECORD_KEYS),
+        "derived_frontmatter_keys": ["id", "slug"],
+        "vocabularies": {
+            "status": list(VALID_STATUS),
+            "privacy": list(VALID_PRIVACY),
+            "confidence": ["low", "medium", "high"],
+            "session_tracking": list(VALID_SESSION_TRACKING),
+        },
+        "rules": {
+            "evidence_or_low_confidence": (
+                "A decision or attempt needs at least one --evidence TYPE REF, or "
+                "--confidence low (validate §16.9)."
+            ),
+        },
+    }
+
+
+def _record_template(rtype: str) -> str:
+    """A copy-pasteable `crumb remember` command skeleton for a record type."""
+    lines = [f"crumb remember {rtype} \\", "  --title 'SHORT IMPERATIVE TITLE' \\"]
+    flag_for = {h: a for a, h in ATTEMPT_FLAG_SECTIONS}
+    for heading in BODY_SECTIONS[rtype]:
+        if heading == "Evidence":
+            continue  # supplied via --evidence, not a body section
+        if rtype == "attempt" and heading in flag_for:
+            lines.append(f"  --{flag_for[heading].replace('_', '-')} 'TEXT' \\")
+        else:
+            lines.append(f"  --set '{heading}' 'TEXT' \\")
+    lines.append("  --evidence commit SHA   # or: --confidence low")
+    return "\n".join(lines)
+
+
+def cmd_schema(args: argparse.Namespace) -> int:
+    rtype = getattr(args, "schema_type", None)
+    if rtype is not None and rtype not in BODY_SECTIONS:
+        _emit_error(args, f"unknown record type {rtype!r}; valid: {', '.join(BODY_SECTIONS)}")
+        return 2
+
+    if getattr(args, "template", False):
+        if rtype is None:
+            _emit_error(args, f"--template needs a record type: {', '.join(BODY_SECTIONS)}")
+            return 2
+        print(_record_template(rtype))
+        return 0
+
+    schema = record_schema()
+    if rtype is not None:
+        schema = {
+            "schema_version": schema["schema_version"],
+            "record_types": {rtype: schema["record_types"][rtype]},
+            "required_frontmatter_keys": schema["required_frontmatter_keys"],
+            "derived_frontmatter_keys": schema["derived_frontmatter_keys"],
+            "vocabularies": schema["vocabularies"],
+            "rules": schema["rules"],
+        }
+
+    if args.json:
+        print(json.dumps(schema, indent=2))
+        return 0
+
+    print(f"breadcrumbs record schema (schema_version {schema['schema_version']})")
+    for rt, spec in schema["record_types"].items():
+        print(f"\n{rt} — body sections (rendered in order):")
+        for s in spec["body_sections"]:
+            print(f"  - {s}")
+    print("\nRequired frontmatter: " + ", ".join(schema["required_frontmatter_keys"]))
+    print("Derived from filename: " + ", ".join(schema["derived_frontmatter_keys"]))
+    print("\nVocabularies:")
+    for name, vals in schema["vocabularies"].items():
+        print(f"  {name+':':12} " + ", ".join(vals))
+    print("\nRule: " + schema["rules"]["evidence_or_low_confidence"])
+    print("\nTip: `crumb schema --template <type>` prints a fill-in command skeleton.")
+    return 0
+
+
+# ---- note (question / trap / idea) — review §6.6 write-surface ------------- #
+
+NOTE_KINDS = ("question", "trap", "idea")
+
+
+def _append_md_block(path: Path, block: str) -> None:
+    """Append a `## ` block to a singleton markdown file (open-questions/known-traps).
+
+    The templates seed a `_No … yet._` placeholder line; the first real block drops
+    it, later blocks append after the existing content. Idempotency is the caller's
+    concern (notes are additive by nature).
+    """
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    kept = [
+        ln
+        for ln in text.splitlines()
+        if not (ln.strip().startswith("_No ") and ln.strip().endswith("yet._"))
+    ]
+    head = "\n".join(kept).rstrip()
+    path.write_text((head + "\n\n" if head else "") + block.rstrip() + "\n", encoding="utf-8")
+
+
+def _question_block(text: str, *, why=None, needs=None, status="open") -> str:
+    lines = [f"## Q: {text}", f"- Opened: {now_iso()[:10]}"]
+    if why:
+        lines.append(f"- Why it matters: {why}")
+    if needs:
+        lines.append(f"- Needs: {needs}")
+    lines.append(f"- Status: {status or 'open'}")
+    return "\n".join(lines)
+
+
+def _trap_block(summary: str, *, slug=None, area=None, symptom=None, why=None,
+                safe=None, verify=None) -> str:
+    slug = slug or slugify(summary)
+    lines = [f"## trap_{slug}: {summary}"]
+    if area:
+        lines.append(f"- Area / files: {area}")
+    if symptom:
+        lines.append(f"- Symptom: {symptom}")
+    if why:
+        lines.append(f"- Why: {why}")
+    if safe:
+        lines.append(f"- Safe approach: {safe}")
+    if verify:
+        lines.append(f"- Verification: {verify}")
+    return "\n".join(lines)
+
+
+def _refresh_resume_packet(memory_dir: Path, project_root: Path) -> None:
+    """Rewrite generated/resume-packet.md so a note/edit doesn't leave it stale (§6.6).
+
+    Best-effort: a refresh failure must never fail the note write itself.
+    """
+    try:
+        packet = build_resume_packet(memory_dir, project_root, stale_days=STALE_AGE_DAYS)
+        gen = memory_dir / "generated"
+        gen.mkdir(parents=True, exist_ok=True)
+        (gen / "resume-packet.md").write_text(
+            render_packet_markdown(packet), encoding="utf-8"
+        )
+    except Exception:  # pragma: no cover - defensive; never block a write on a projection
+        pass
+
+
+def note(
+    memory_dir: Path,
+    project_root: Path,
+    kind: str,
+    text: str,
+    *,
+    fields: dict | None = None,
+    tags: list[str] | None = None,
+    agent: str = "human",
+) -> dict:
+    """Write an open-question / known-trap / idea and refresh projections (review §6.6).
+
+    Closes the read/write asymmetry: these were readable (MCP resources, resume,
+    audit) but had no writer. question/trap append a parse-verified block to the
+    singleton markdown file; idea goes through the same `write_record` + validate
+    gate as `remember`. On any parse/validate failure the write is reverted.
+    """
+    fields = fields or {}
+    text = text.strip()
+    if not text:
+        return {"ok": False, "error": "note text must not be empty"}
+
+    if kind == "question":
+        path = memory_dir / "open-questions.md"
+        before = path.read_text(encoding="utf-8") if path.exists() else ""
+        _append_md_block(
+            path,
+            _question_block(text, why=fields.get("why"), needs=fields.get("needs"),
+                            status=fields.get("status")),
+        )
+        if not any(q["question"] == text for q in load_open_questions(memory_dir)):
+            path.write_text(before, encoding="utf-8")  # revert
+            return {"ok": False, "error": "appended question did not parse back; reverted"}
+        result = {"ok": True, "kind": "question", "ref": text, "path": str(path)}
+
+    elif kind == "trap":
+        path = memory_dir / "known-traps.md"
+        before = path.read_text(encoding="utf-8") if path.exists() else ""
+        slug = fields.get("slug") or slugify(text)
+        _append_md_block(
+            path,
+            _trap_block(text, slug=slug, area=fields.get("area"),
+                        symptom=fields.get("symptom"), why=fields.get("why"),
+                        safe=fields.get("safe"), verify=fields.get("verify")),
+        )
+        marker = f"trap_{slug}:".lower()
+        if not any(b["heading"].lower().startswith(marker) for b in load_traps(memory_dir)):
+            path.write_text(before, encoding="utf-8")  # revert
+            return {"ok": False, "error": "appended trap did not parse back; reverted"}
+        result = {"ok": True, "kind": "trap", "ref": f"trap_{slug}", "path": str(path)}
+
+    elif kind == "idea":
+        sections = dict(fields.get("sections") or {})
+        try:
+            path, meta = write_record(
+                memory_dir, project_root, "idea", text, sections, tags=tags, agent=agent
+            )
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        fails = _validate_new_file(memory_dir, path)
+        if fails:
+            path.unlink()  # revert
+            return {
+                "ok": False,
+                "error": "idea rejected by validate: " + "; ".join(f["message"] for f in fails),
+            }
+        result = {"ok": True, "kind": "idea", "id": meta["id"], "path": str(path)}
+
+    else:
+        return {"ok": False, "error": f"unknown note kind {kind!r}; use {', '.join(NOTE_KINDS)}"}
+
+    _refresh_resume_packet(memory_dir, project_root)
+    return result
+
+
+def cmd_note(args: argparse.Namespace) -> int:
+    kind = getattr(args, "note_kind", None)
+    if kind not in NOTE_KINDS:
+        _emit_error(args, f"specify a note kind: `crumb note {'|'.join(NOTE_KINDS)}`")
+        return 2
+
+    root = resolve_root(args.project)
+    memory_dir = root / MEMORY_DIRNAME
+    if not memory_dir.is_dir():
+        _emit_error(args, f"no {MEMORY_DIRNAME}/ found at {root}. Run `crumb init` first.")
+        return 2
+
+    fields: dict = {}
+    tags: list[str] | None = None
+    if kind == "question":
+        fields = {"why": args.why, "needs": args.needs, "status": args.status}
+    elif kind == "trap":
+        fields = {
+            "slug": args.slug, "area": args.area, "symptom": args.symptom,
+            "why": args.why, "safe": args.safe, "verify": args.verify,
+        }
+    else:  # idea
+        try:
+            fields = {"sections": _collect_set_sections("idea", args.set)}
+        except ValueError as exc:
+            _emit_error(args, str(exc))
+            return 2
+        tags = _split_tags(args.tags)
+
+    result = note(memory_dir, root, kind, args.text or "", fields=fields, tags=tags,
+                  agent=getattr(args, "agent", "human"))
+    if not result.get("ok"):
+        _emit_error(args, result.get("error", "note failed"))
+        return 1
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"Noted {kind}: {result.get('id') or result.get('ref')}")
+        print(f"  file: {result['path']}")
+    return 0
+
+
 # ---- capture session ------------------------------------------------------- #
 
 def _last_session_commit(memory_dir: Path) -> str | None:
@@ -1436,6 +1826,28 @@ def _last_session_commit(memory_dir: Path) -> str | None:
 
 # git's canonical empty-tree object — diff base when the window reaches the root commit.
 _GIT_EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+
+def _summarize_diffstat(shortstat: str | None) -> str:
+    """Condense `git diff --shortstat` into one line: 'N files changed, +X/-Y'.
+
+    Inlining the full per-file `--stat` bloats committed session records and can
+    trip the secret scanner on path-shaped tokens (review §6.1); a counts-only
+    summary avoids both while preserving the at-a-glance signal.
+    """
+    if not shortstat or not shortstat.strip():
+        return "_(no file changes detected)_"
+    files = ins = dels = 0
+    m = re.search(r"(\d+)\s+files?\s+changed", shortstat)
+    if m:
+        files = int(m.group(1))
+    m = re.search(r"(\d+)\s+insertions?\(\+\)", shortstat)
+    if m:
+        ins = int(m.group(1))
+    m = re.search(r"(\d+)\s+deletions?\(-\)", shortstat)
+    if m:
+        dels = int(m.group(1))
+    return f"{files} files changed, +{ins}/-{dels}"
 
 
 def _git_prefill(root: Path, since: str | None) -> dict[str, str]:
@@ -1467,10 +1879,10 @@ def _git_prefill(root: Path, since: str | None) -> dict[str, str]:
             parent = _git_out(root, "rev-parse", "--verify", f"{oldest}^")
             base = parent if parent else _GIT_EMPTY_TREE
 
-    diff = _git_out(root, "diff", "--stat", base, "HEAD") if base else None
+    shortstat = _git_out(root, "diff", "--shortstat", base, "HEAD") if base else None
 
     work = "\n".join(f"- {line}" for line in log.splitlines()) if log else "_(no new commits)_"
-    files = diff.strip() if diff and diff.strip() else "_(no file changes detected)_"
+    files = _summarize_diffstat(shortstat)
     return {
         "Work Completed": work,
         "Files Touched": files,
@@ -3086,17 +3498,69 @@ def _shannon_entropy(s: str) -> float:
     return -sum((c / n) * math.log2(c / n) for c in counts.values())
 
 
+# A path/identifier segment: a run of letters and digits with no separators.
+_IDENT_SEGMENT = re.compile(r"^[A-Za-z0-9]+$")
+# A pronounceable "word": a letter followed by 3+ lowercase letters (e.g. the
+# CamelCase subwords Migration/Database/Test). Random base64 yields at most a stray
+# short run, never enough to cover half the segment.
+_WORD_RE = re.compile(r"[A-Za-z][a-z]{3,}")
+
+
+def _segment_is_wordy(seg: str) -> bool:
+    """True if CamelCase words cover most of the segment (identifier, not a blob).
+
+    Requires vowel-bearing words to span ≥half the segment (and ≥6 chars), so a real
+    identifier (Database/Migration/Helper…) qualifies while a random base64 run with
+    an incidental 4-letter sequence does not.
+    """
+    covered = sum(
+        len(w) for w in _WORD_RE.findall(seg) if any(c in "aeiouAEIOU" for c in w)
+    )
+    return covered >= 6 and covered * 2 >= len(seg)
+
+
+def _looks_like_path_or_identifier(tok: str) -> bool:
+    """True for path- or dotted-identifier-shaped tokens that only *look* random.
+
+    Long CamelCase identifiers like ``DatabaseMigrationHelperV2Factory`` and paths
+    like ``app/src/MigrationV14ToV15Test`` clear the mixed-class + entropy bar yet
+    are obviously not secrets (review §6.4). The discriminator is deliberately narrow
+    so it cannot launder a real secret: base64 padding/charset (`+`, `=`) disqualifies
+    outright; every segment must be alphanumeric; and any segment long enough to be a
+    blob (≥12 chars) must read as CamelCase words, with at least one wordy segment
+    overall. A bare random run has no words and stays flagged.
+    """
+    if "+" in tok or "=" in tok:
+        return False  # base64-specific characters never occur in paths/identifiers
+    segments = [s for s in re.split(r"[/._-]", tok) if s]
+    if not segments:
+        return False
+    has_word = False
+    for seg in segments:
+        if not _IDENT_SEGMENT.match(seg):
+            return False
+        if _segment_is_wordy(seg):
+            has_word = True
+        elif len(seg) >= 12:
+            return False  # a long, word-free segment is a blob, not a path component
+    return has_word
+
+
 def _looks_high_entropy(tok: str) -> bool:
     """True only for mixed-class, genuinely-random-looking tokens.
 
     Requires lower + upper + digit (so hex shas and lowercase ids never qualify) and
     a real entropy floor. Conservative by design — misses some secrets, flags ~no ids.
+    Path- and identifier-shaped tokens are allowlisted (review §6.4) without lowering
+    the entropy floor, so real secrets are unaffected.
     """
     if not (
         any(c.islower() for c in tok)
         and any(c.isupper() for c in tok)
         and any(c.isdigit() for c in tok)
     ):
+        return False
+    if _looks_like_path_or_identifier(tok):
         return False
     return _shannon_entropy(tok) >= 3.5
 
@@ -3476,6 +3940,575 @@ def cmd_scan_secrets(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Integrations — bootstrapping the automaticity primitives (review §5/§7)
+# --------------------------------------------------------------------------- #
+#
+# The package already ships every ingredient for automatic use (the fenced
+# managed-block writer, the ADAPTER_FILENAMES list, the breadcrumbs-mcp server);
+# this section assembles them behind explicit consent and makes each edit fenced
+# and reversible. Default `crumb init` behavior is unchanged — integrations are
+# opt-in (flags, or the first-run interactive picker).
+
+MCP_SERVER_NAME = "breadcrumbs"
+
+
+def mcp_server_entry() -> dict:
+    """The `.mcp.json` entry for the breadcrumbs server (verified Claude Code shape).
+
+    The server reads $BREADCRUMBS_PROJECT to locate the store; `${CLAUDE_PROJECT_DIR}`
+    is exported by Claude Code, with a `.`-fallback for other launchers.
+    """
+    return {
+        "type": "stdio",
+        "command": "breadcrumbs-mcp",
+        "args": [],
+        "env": {"BREADCRUMBS_PROJECT": "${CLAUDE_PROJECT_DIR:-.}"},
+    }
+
+
+def register_mcp(root: Path) -> Path:
+    """Merge the breadcrumbs server into `.mcp.json`, preserving any other servers."""
+    path = root / ".mcp.json"
+
+    def _mut(data: dict) -> None:
+        servers = data.setdefault("mcpServers", {})
+        servers[MCP_SERVER_NAME] = mcp_server_entry()
+
+    merge_json_file(path, _mut)
+    return path
+
+
+def unregister_mcp(root: Path) -> bool:
+    """Remove the breadcrumbs server from `.mcp.json`. True iff it was present."""
+    path = root / ".mcp.json"
+    if not path.exists():
+        return False
+    state = {"present": False}
+
+    def _mut(data: dict) -> None:
+        servers = data.get("mcpServers")
+        if isinstance(servers, dict) and MCP_SERVER_NAME in servers:
+            del servers[MCP_SERVER_NAME]
+            state["present"] = True
+            if not servers:
+                data.pop("mcpServers", None)
+
+    merge_json_file(path, _mut)
+    return state["present"]
+
+
+def _mcp_sdk_available() -> bool:
+    """Whether the optional [mcp] extra is importable (lazy; never hard-fails)."""
+    try:
+        from breadcrumbs import mcp_server
+
+        return mcp_server.sdk_available()
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
+def cmd_mcp(args: argparse.Namespace) -> int:
+    what = getattr(args, "mcp_what", None)
+    if what == "serve":
+        # Lazy import keeps `crumb` stdlib-only; the server degrades with a clear
+        # hint when the [mcp] extra is missing.
+        from breadcrumbs import mcp_server
+
+        return mcp_server.main([])
+
+    if what == "register":
+        root = resolve_root(args.project)
+        path = register_mcp(root)
+        sdk = _mcp_sdk_available()
+        summary = {"registered": str(path), "server": MCP_SERVER_NAME, "sdk_available": sdk}
+        if args.json:
+            print(json.dumps(summary, indent=2))
+        else:
+            print(f"Registered MCP server '{MCP_SERVER_NAME}' in {path}")
+            if not sdk:
+                print("  note: the MCP SDK isn't installed — run: pip install 'crumb-kit[mcp]'")
+        return 0
+
+    _emit_error(args, "specify: `crumb mcp serve` or `crumb mcp register`")
+    return 2
+
+
+# ---- adapter signpost block (review §7.1) ---------------------------------- #
+
+# Markdown-comment markers for the adapter managed block (same fence mechanism as
+# .gitignore, different comment syntax).
+ADAPTER_BEGIN = (
+    "<!-- >>> breadcrumbs managed block (managed by `crumb init`) "
+    "— edit above/below, not inside >>> -->"
+)
+ADAPTER_END = "<!-- <<< breadcrumbs managed block <<< -->"
+
+
+def adapter_block() -> str:
+    """The signpost injected into agent-guidance files: a small pointer, not a copy.
+
+    Deliberately tiny (well under ADAPTER_BLOAT_CHARS) so the tool's own `audit`
+    stays green — it practices what it preaches. Generic guidance text, never a
+    record body, so it cannot trip audit's record-duplication check.
+    """
+    return "\n".join([
+        ADAPTER_BEGIN,
+        "## Project memory (breadcrumbs)",
+        "",
+        "This repo has a durable memory store under `.project-memory/`. Use it:",
+        "",
+        "- **Starting work / new session:** read the resume packet first —",
+        "  `crumb resume` (or MCP resource `memory://resume-packet`).",
+        "- **Before any risky or irreversible action** (deletes, force-push, schema",
+        "  or build-system changes, rewrites): `crumb guard \"<action>\"` and honor a",
+        "  `PAUSE` / `ASK_HUMAN` verdict.",
+        "- **After a durable decision or a failed approach:**",
+        "  `crumb remember decision|attempt …`.",
+        "- **Leaving a note for the next agent:** `crumb note question|trap|idea …`.",
+        "- **Session end:** `crumb capture session`.",
+        "",
+        "Memory must never contain secrets; `crumb scan-secrets` gates commits.",
+        ADAPTER_END,
+    ]) + "\n"
+
+
+def present_adapters(root: Path) -> list[str]:
+    """Adapter-guidance files that already exist (we never create new ones)."""
+    return [name for name in ADAPTER_FILENAMES if (root / name).is_file()]
+
+
+def write_adapter_block(root: Path, name: str) -> None:
+    rewrite_managed_block(root / name, ADAPTER_BEGIN, ADAPTER_END, adapter_block())
+
+
+def remove_adapter_block(root: Path, name: str) -> bool:
+    """Strip our managed block from an adapter file. True iff it was present."""
+    path = root / name
+    if not path.exists():
+        return False
+    had = ADAPTER_BEGIN in path.read_text(encoding="utf-8")
+    rewrite_managed_block(path, ADAPTER_BEGIN, ADAPTER_END, None)
+    return had
+
+
+# ---- Claude Code hooks (review §7.3 / Appendix A.6) ------------------------ #
+
+HOOK_EVENTS = ("session", "guard", "capture")
+# breadcrumbs event -> (Claude Code event name, PreToolUse matcher or None, command)
+_HOOK_SPECS: dict[str, tuple[str, str | None, str]] = {
+    "session": ("SessionStart", None, "crumb hook session"),
+    "guard": ("PreToolUse", "Bash|Edit|Write|MultiEdit", "crumb hook guard"),
+    "capture": ("Stop", None, "crumb hook capture"),
+}
+
+
+def _group_has_command(group: object, command: str) -> bool:
+    return isinstance(group, dict) and any(
+        isinstance(h, dict) and h.get("command") == command
+        for h in group.get("hooks", [])
+    )
+
+
+def _group_is_breadcrumbs(group: object) -> bool:
+    return isinstance(group, dict) and any(
+        isinstance(h, dict) and str(h.get("command", "")).startswith("crumb hook")
+        for h in group.get("hooks", [])
+    )
+
+
+def install_claude_hooks(root: Path, events: list[str]) -> Path:
+    """Merge SessionStart/PreToolUse/Stop hooks into .claude/settings.json.
+
+    Appends to existing hook arrays (never clobbers other hooks) and is idempotent —
+    re-running does not duplicate the breadcrumbs entries.
+    """
+    path = root / ".claude" / "settings.json"
+
+    def _mut(data: dict) -> None:
+        hooks = data.setdefault("hooks", {})
+        for ev in events:
+            cc_event, matcher, command = _HOOK_SPECS[ev]
+            arr = hooks.setdefault(cc_event, [])
+            if any(_group_has_command(g, command) for g in arr):
+                continue  # idempotent
+            entry: dict = {"hooks": [{"type": "command", "command": command}]}
+            if matcher:
+                entry = {"matcher": matcher, **entry}
+            arr.append(entry)
+
+    merge_json_file(path, _mut)
+    return path
+
+
+def remove_claude_hooks(root: Path) -> bool:
+    """Remove only the `crumb hook …` entries from .claude/settings.json. True iff any."""
+    path = root / ".claude" / "settings.json"
+    if not path.exists():
+        return False
+    state = {"removed": False}
+
+    def _mut(data: dict) -> None:
+        hooks = data.get("hooks")
+        if not isinstance(hooks, dict):
+            return
+        for cc_event in list(hooks):
+            arr = hooks.get(cc_event)
+            if not isinstance(arr, list):
+                continue
+            kept = [g for g in arr if not _group_is_breadcrumbs(g)]
+            if len(kept) != len(arr):
+                state["removed"] = True
+            if kept:
+                hooks[cc_event] = kept
+            else:
+                del hooks[cc_event]
+        if not hooks:
+            data.pop("hooks", None)
+
+    merge_json_file(path, _mut)
+    return state["removed"]
+
+
+# ---- integration plan: resolve flags / prompt, apply, remove, describe ----- #
+
+FIRST_RUN_NUDGE = (
+    "note: .project-memory/ is set up, but no agent integration was installed.\n"
+    "      The store is only used if your agent is told to use it. Wire it up with\n"
+    "      `crumb init --with-adapter --with-mcp` (and `--with-hooks`), or check\n"
+    "      status anytime with `crumb doctor`."
+)
+
+
+def _resolve_tristate_list(value, all_items: list[str]) -> list[str] | None:
+    """Map a --with-X[=a,b] / --no-X flag value to a concrete list, or None if unset.
+
+    False -> [] (disabled); None -> None (undecided); "*" -> all_items; "a,b" -> [a,b].
+    """
+    if value is False:
+        return []
+    if value is None:
+        return None
+    if value == "*":
+        return list(all_items)
+    return [s.strip() for s in str(value).split(",") if s.strip()]
+
+
+def _prompt_yes(question: str, default: bool) -> bool:
+    suffix = " [Y/n] " if default else " [y/N] "
+    try:
+        ans = input(question + suffix).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return default
+    if not ans:
+        return default
+    return ans in ("y", "yes")
+
+
+def resolve_integration_plan(root: Path, args: argparse.Namespace) -> dict:
+    """Resolve which integrations to apply from flags, detection, and (TTY) prompts.
+
+    Returns {"adapters": [...], "mcp": bool, "hooks": [...]}. On a TTY with an
+    integration left unspecified, the user is asked once per integration (the
+    first-run picker). Non-interactive + unspecified means "off".
+    """
+    detected = present_adapters(root)
+    adapters = _resolve_tristate_list(getattr(args, "adapter", None), detected)
+    hooks = _resolve_tristate_list(getattr(args, "hooks", None), list(HOOK_EVENTS))
+    mcp = getattr(args, "mcp", None)  # True / False / None
+
+    interactive = _interactive()
+    undecided = adapters is None or mcp is None or hooks is None
+    if interactive and undecided:
+        print("Set up agent integrations so the store is actually used (each is reversible):")
+        if adapters is None:
+            if detected:
+                adapters = detected if _prompt_yes(
+                    f"  Inject the signpost block into {', '.join(detected)}?", True
+                ) else []
+            else:
+                adapters = []  # nothing to point at; don't create files
+        if mcp is None:
+            mcp = _prompt_yes("  Register the MCP server in .mcp.json?", True)
+        if hooks is None:
+            hooks = list(HOOK_EVENTS) if _prompt_yes(
+                "  Install Claude Code hooks (auto resume/guard/capture)?", False
+            ) else []
+
+    return {
+        "adapters": adapters or [],
+        "mcp": bool(mcp),
+        "hooks": hooks or [],
+    }
+
+
+def apply_integrations(root: Path, plan: dict) -> dict:
+    """Write the resolved integrations; return a summary of what was touched."""
+    applied: dict = {"adapters": [], "mcp": None, "hooks": []}
+    for name in plan["adapters"]:
+        if (root / name).is_file():
+            write_adapter_block(root, name)
+            applied["adapters"].append(name)
+    if plan["mcp"]:
+        applied["mcp"] = str(register_mcp(root))
+    if plan["hooks"]:
+        install_claude_hooks(root, plan["hooks"])
+        applied["hooks"] = list(plan["hooks"])
+    return applied
+
+
+def remove_integrations(root: Path) -> dict:
+    """Reverse every integration breadcrumbs added; leave all other content intact."""
+    removed: dict = {"adapters": [], "mcp": False, "hooks": False}
+    for name in ADAPTER_FILENAMES:
+        if remove_adapter_block(root, name):
+            removed["adapters"].append(name)
+    removed["mcp"] = unregister_mcp(root)
+    removed["hooks"] = remove_claude_hooks(root)
+    return removed
+
+
+# ---- crumb doctor (review §A.7) -------------------------------------------- #
+
+def doctor_report(root: Path) -> dict:
+    """Integration-health report: is memory actually wired up?"""
+    memory_dir = root / MEMORY_DIRNAME
+    checks: list[dict] = []
+
+    def add(name: str, ok: bool, detail: str) -> None:
+        checks.append({"check": name, "ok": ok, "detail": detail})
+
+    store = memory_dir.is_dir()
+    add("store", store, f"{MEMORY_DIRNAME}/ present" if store else f"no {MEMORY_DIRNAME}/ — run `crumb init`")
+
+    # Adapter blocks
+    present = present_adapters(root)
+    blocked = [n for n in present if ADAPTER_BEGIN in (root / n).read_text(encoding="utf-8")]
+    bloated = [
+        n for n in blocked if len((root / n).read_text(encoding="utf-8")) > ADAPTER_BLOAT_CHARS
+    ]
+    add(
+        "adapter",
+        bool(blocked) and not bloated,
+        (f"signpost in {', '.join(blocked)}" if blocked else
+         (f"adapter files present ({', '.join(present)}) but no signpost block" if present
+          else "no agent-guidance files detected")) + (f"; BLOATED: {', '.join(bloated)}" if bloated else ""),
+    )
+
+    # MCP registration + extra
+    mcp_path = root / ".mcp.json"
+    registered = False
+    if mcp_path.is_file():
+        try:
+            registered = MCP_SERVER_NAME in (json.loads(mcp_path.read_text(encoding="utf-8")).get("mcpServers") or {})
+        except (json.JSONDecodeError, OSError):
+            registered = False
+    sdk = _mcp_sdk_available()
+    add("mcp", registered, ".mcp.json registered" if registered else "not registered (`crumb mcp register`)")
+    add("mcp_extra", sdk, "[mcp] extra importable" if sdk else "optional [mcp] extra not installed")
+
+    # Hooks
+    hook_cmds = _installed_hook_commands(root)
+    add("hooks", bool(hook_cmds), f"{len(hook_cmds)} crumb hook(s) installed" if hook_cmds else "no hooks installed")
+
+    # Resume-packet staleness vs HEAD
+    if store:
+        packet = memory_dir / "generated" / "resume-packet.md"
+        if packet.is_file():
+            stale = _packet_is_stale(memory_dir, root)
+            add("resume_packet", not stale, "stale vs HEAD — run `crumb resume`" if stale else "fresh")
+        else:
+            add("resume_packet", False, "not generated — run `crumb resume`")
+
+    integrated = any(c["ok"] for c in checks if c["check"] in ("adapter", "mcp", "hooks"))
+    return {"checks": checks, "integrated": integrated, "store": store}
+
+
+def _installed_hook_commands(root: Path) -> list[str]:
+    path = root / ".claude" / "settings.json"
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    cmds: list[str] = []
+    for arr in (data.get("hooks") or {}).values():
+        if not isinstance(arr, list):
+            continue
+        for group in arr:
+            if isinstance(group, dict):
+                for h in group.get("hooks", []):
+                    c = isinstance(h, dict) and str(h.get("command", ""))
+                    if c and c.startswith("crumb hook"):
+                        cmds.append(c)
+    return cmds
+
+
+def _packet_is_stale(memory_dir: Path, root: Path) -> bool:
+    """Best-effort: True if the committed packet's inputs hash no longer matches."""
+    try:
+        packet = build_resume_packet(memory_dir, root)
+        current = render_packet_markdown(packet)
+        on_disk = (memory_dir / "generated" / "resume-packet.md").read_text(encoding="utf-8")
+        return _strip_packet_volatile(current) != _strip_packet_volatile(on_disk)
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
+def _strip_packet_volatile(md: str) -> str:
+    """Drop the generated_at line so a pure-timestamp delta is not read as staleness."""
+    return "\n".join(
+        ln for ln in md.splitlines() if "generated_at:" not in ln
+    )
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    root = resolve_root(args.project)
+    report = doctor_report(root)
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print("crumb doctor — integration health")
+        for c in report["checks"]:
+            mark = "✓" if c["ok"] else "✗"
+            print(f"  {mark} [{c['check']}] {c['detail']}")
+        if report["store"] and not report["integrated"]:
+            print("\n" + FIRST_RUN_NUDGE)
+    # Non-zero when a store exists but nothing is wired up (the §5 finding, machine-checkable).
+    return 0 if (report["integrated"] or not report["store"]) else 1
+
+
+# ---- crumb hook session|guard|capture (review §A.6) ------------------------ #
+
+def _read_hook_stdin() -> dict:
+    try:
+        raw = sys.stdin.read()
+    except OSError:
+        return {}
+    try:
+        return json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _hook_root(payload: dict) -> Path:
+    return Path(
+        payload.get("cwd") or os.environ.get("BREADCRUMBS_PROJECT") or Path.cwd()
+    ).resolve()
+
+
+# Cheap risk patterns the keyword classifier misses (destructive shell/git ops).
+# Used only to decide whether to escalate to full guard — a pure regex scan of a
+# short string, no record I/O, so the common path stays well inside the hook budget.
+_HOOK_RISK_RE = re.compile(
+    r"(?i)(--force\b|force-push|push\s+-f\b|reset\s+--hard|rm\s+-rf|git\s+clean|"
+    r"gradlew\s+--stop|--stop\b|drop\s+table|truncate\b|--no-verify|branch\s+-D\b)"
+)
+
+
+def _hook_action_from_tool(tool: str, tool_input: dict) -> tuple[str, list[str] | None]:
+    """Derive a guard action string + affected files from a PreToolUse payload."""
+    if tool == "Bash":
+        return (tool_input.get("command") or "").strip(), None
+    if tool in ("Edit", "Write", "MultiEdit"):
+        fp = tool_input.get("file_path") or tool_input.get("path") or ""
+        return (f"edit {fp}".strip(), [fp] if fp else None)
+    return "", None
+
+
+def _hook_guard_reason(result: dict) -> str:
+    lines = [f"breadcrumbs guard: {result['verdict']} for this action."]
+    for m in result.get("matches", [])[:3]:
+        title = m.get("title") or m.get("id") or "record"
+        why = m.get("reason") or ""
+        lines.append(f"- {title}" + (f" ({why})" if why else ""))
+    return "\n".join(lines)
+
+
+def _hook_session(memory_dir: Path, root: Path) -> int:
+    out: dict = {}
+    if memory_dir.is_dir():
+        try:
+            packet = build_resume_packet(memory_dir, root)
+            out = {
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": render_packet_markdown(packet),
+                }
+            }
+        except Exception:  # pragma: no cover - never fail a session start on memory
+            out = {}
+    print(json.dumps(out))
+    return 0
+
+
+def _hook_guard(memory_dir: Path, root: Path, payload: dict) -> int:
+    if not memory_dir.is_dir():
+        print(json.dumps({}))
+        return 0
+    action, files = _hook_action_from_tool(payload.get("tool_name") or "", payload.get("tool_input") or {})
+    if not action:
+        print(json.dumps({}))
+        return 0
+    # Cost-aware pre-filter: pure-string classify + risk regex (no record I/O) on the
+    # common path. Only a plausibly-risky action escalates to full guard scoring.
+    _primary, classes = classify_action(action)
+    risky = classes != ["routine_edit"] or bool(_HOOK_RISK_RE.search(action))
+    if not risky:
+        print(json.dumps({}))
+        return 0
+    result = guard(memory_dir, root, action, files=files)
+    verdict = result["verdict"]
+    if verdict == "PROCEED":
+        print(json.dumps({}))
+        return 0
+    decision = "ask" if verdict == "ASK_HUMAN" else "allow"
+    out = {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": decision,  # memory informs; it never denies on its own
+            "permissionDecisionReason": _hook_guard_reason(result),
+        }
+    }
+    print(json.dumps(out))
+    return 0
+
+
+def _hook_capture(memory_dir: Path, root: Path, payload: dict) -> int:
+    if not memory_dir.is_dir():
+        print(json.dumps({}))
+        return 0
+    # Reuse the same --fast snapshot path the CLI uses (diff-stat already summarized).
+    ns = argparse.Namespace(
+        project=str(root), json=True, plain=False, verbose=False, fast=True,
+        next_action="(session ended; see git log)", title="session", set=None,
+        focus=None, agent="agent", capture_what="session",
+    )
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            cmd_capture_session(ns)
+    except Exception:  # pragma: no cover - a capture failure must not block Stop
+        pass
+    print(json.dumps({}))
+    return 0
+
+
+def cmd_hook(args: argparse.Namespace) -> int:
+    event = getattr(args, "hook_event", None)
+    payload = _read_hook_stdin()
+    root = _hook_root(payload)
+    memory_dir = root / MEMORY_DIRNAME
+    if event == "session":
+        return _hook_session(memory_dir, root)
+    if event == "guard":
+        return _hook_guard(memory_dir, root, payload)
+    if event == "capture":
+        return _hook_capture(memory_dir, root, payload)
+    _emit_error(args, "specify: `crumb hook session|guard|capture`")
+    return 2
+
+
+# --------------------------------------------------------------------------- #
 # Argument parsing
 # --------------------------------------------------------------------------- #
 
@@ -3573,7 +4606,30 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="overwrite an existing .project-memory/ scaffold",
     )
-    p_init.set_defaults(func=cmd_init)
+    # Integration flags (review §7). Tri-state: unset -> prompt on a TTY / off when
+    # non-interactive; --with-* enables; --no-* disables. set_defaults keeps all three
+    # at None so default `crumb init` is byte-identical to before.
+    p_init.add_argument("--with-adapter", dest="adapter", nargs="?", const="*",
+                        metavar="FILES",
+                        help="inject the signpost block into detected agent-guidance "
+                             "files (optional: comma-separated list)")
+    p_init.add_argument("--no-adapter", dest="adapter", action="store_const", const=False,
+                        help="do not touch agent-guidance files")
+    p_init.add_argument("--with-mcp", dest="mcp", action="store_const", const=True,
+                        help="register the MCP server in .mcp.json")
+    p_init.add_argument("--no-mcp", dest="mcp", action="store_const", const=False,
+                        help="do not register the MCP server")
+    p_init.add_argument("--with-hooks", dest="hooks", nargs="?", const="*",
+                        metavar="EVENTS",
+                        help="install Claude Code hooks (optional: comma list of "
+                             "session,guard,capture)")
+    p_init.add_argument("--no-hooks", dest="hooks", action="store_const", const=False,
+                        help="do not install hooks")
+    p_init.add_argument("--print-integrations", action="store_true",
+                        help="show which integrations would be applied, then exit")
+    p_init.add_argument("--remove-integrations", action="store_true",
+                        help="reverse every breadcrumbs integration, then exit")
+    p_init.set_defaults(func=cmd_init, adapter=None, mcp=None, hooks=None)
 
     # validate (Phase 2)
     p_validate = sub.add_parser(
@@ -3618,7 +4674,70 @@ def build_parser() -> argparse.ArgumentParser:
         pr.add_argument("--scope")
         pr.add_argument("--status", choices=VALID_STATUS)
         pr.add_argument("--agent", default="human", help="record author label (default: human)")
+        if rtype == "attempt":
+            # The fixed attempt vocabulary as named flags (review §6.2/§8); each
+            # overrides the matching --set heading.
+            pr.add_argument("--problem", help="Problem section")
+            pr.add_argument("--tried", help="Tried section")
+            pr.add_argument("--result", help="Result section")
+            pr.add_argument("--why", help="'Why It Failed / Succeeded' section")
+            pr.add_argument("--do-not-retry", dest="do_not_retry",
+                            help="'Do Not Retry Unless' section")
+            pr.add_argument("--related", help="'Related Records' section")
         pr.set_defaults(func=cmd_remember)
+
+    # schema introspection (review §6.2/§8)
+    p_schema = sub.add_parser(
+        "schema",
+        parents=[global_parser],
+        help="print the record schema contract (or a fill-in template)",
+    )
+    p_schema.add_argument(
+        "schema_type", nargs="?", metavar="<type>",
+        help="limit to one record type (decision|attempt|session|idea)",
+    )
+    p_schema.add_argument(
+        "--template", action="store_true",
+        help="emit a copy-pasteable `crumb remember <type>` command skeleton",
+    )
+    p_schema.set_defaults(func=cmd_schema)
+
+    # note question|trap|idea (review §6.6 write-surface)
+    p_note = sub.add_parser(
+        "note",
+        parents=[global_parser],
+        help="leave an open question, known trap, or idea for the next agent",
+    )
+    p_note.set_defaults(func=cmd_note, note_kind=None)
+    note_sub = p_note.add_subparsers(dest="note_kind", metavar="<kind>")
+
+    pq = note_sub.add_parser("question", parents=[global_parser],
+                             help="record an open question")
+    pq.add_argument("text", help="the question, in one line")
+    pq.add_argument("--why", help="why it matters / what is blocked")
+    pq.add_argument("--needs", help="human input | investigation | a decision")
+    pq.add_argument("--status", default="open", help="status (default: open)")
+    pq.set_defaults(func=cmd_note)
+
+    pt = note_sub.add_parser("trap", parents=[global_parser],
+                             help="record a reusable known trap")
+    pt.add_argument("text", help="one-line trap summary")
+    pt.add_argument("--slug", help="short slug (derived from the summary if omitted)")
+    pt.add_argument("--area", help="where this bites (files / area)")
+    pt.add_argument("--symptom", help="what goes wrong")
+    pt.add_argument("--why", help="the mechanism, not vibes")
+    pt.add_argument("--safe", help="the safe approach to use instead")
+    pt.add_argument("--verify", help="a command that proves it is OK")
+    pt.set_defaults(func=cmd_note)
+
+    pi = note_sub.add_parser("idea", parents=[global_parser],
+                             help="record a speculative idea")
+    pi.add_argument("text", help="the idea title")
+    pi.add_argument("--set", nargs=2, action="append", metavar=("HEADING", "TEXT"),
+                    help="set an idea body section (repeatable)")
+    pi.add_argument("--tags", help="comma-separated tags")
+    pi.add_argument("--agent", default="human", help="note author label (default: human)")
+    pi.set_defaults(func=cmd_note)
 
     # capture session (Phase 3)
     p_capture = sub.add_parser(
@@ -3727,7 +4846,49 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_scan.set_defaults(func=cmd_scan_secrets)
 
-    # Later-phase commands are intentionally not registered yet (Phase 7+).
+    # mcp serve|register — surface the optional MCP server from the CLI (review §6.3)
+    p_mcp = sub.add_parser(
+        "mcp",
+        parents=[global_parser],
+        help="run or register the optional breadcrumbs MCP server",
+    )
+    p_mcp.set_defaults(func=cmd_mcp, mcp_what=None)
+    mcp_sub = p_mcp.add_subparsers(dest="mcp_what", metavar="<what>")
+    p_mcp_serve = mcp_sub.add_parser(
+        "serve", parents=[global_parser],
+        help="run the MCP server over stdio (needs the [mcp] extra)",
+    )
+    p_mcp_serve.set_defaults(func=cmd_mcp, mcp_what="serve")
+    p_mcp_register = mcp_sub.add_parser(
+        "register", parents=[global_parser],
+        help="add the breadcrumbs server to .mcp.json (preserves other servers)",
+    )
+    p_mcp_register.set_defaults(func=cmd_mcp, mcp_what="register")
+
+    # doctor — integration health (review §A.7)
+    p_doctor = sub.add_parser(
+        "doctor",
+        parents=[global_parser],
+        help="report whether memory is actually wired up (adapter/mcp/hooks/packet)",
+    )
+    p_doctor.set_defaults(func=cmd_doctor)
+
+    # hook session|guard|capture — harness translation layer (review §A.6)
+    p_hook = sub.add_parser(
+        "hook",
+        parents=[global_parser],
+        help="Claude Code hook entry points (read stdin payload, emit hook JSON)",
+    )
+    p_hook.set_defaults(func=cmd_hook, hook_event=None)
+    hook_sub = p_hook.add_subparsers(dest="hook_event", metavar="<event>")
+    for ev, _help in (
+        ("session", "SessionStart: emit the resume packet as additional context"),
+        ("guard", "PreToolUse: cost-aware guard verdict for the proposed tool call"),
+        ("capture", "Stop: snapshot a session record"),
+    ):
+        ph = hook_sub.add_parser(ev, parents=[global_parser], help=_help)
+        ph.set_defaults(func=cmd_hook, hook_event=ev)
+
     return parser
 
 

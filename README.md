@@ -99,14 +99,19 @@ core rather than reimplement it.
 
 ```bash
 crumb init                       # install .project-memory/ + manifest + .gitignore rules
+crumb init --with-adapter --with-mcp --with-hooks   # ...and wire it into your agent (see Integrations)
 crumb validate                   # deterministically check the store (schema + invariants)
+crumb schema                     # print the record contract (sections, vocab, rules)
 crumb remember decision          # capture a durable choice
+crumb note question|trap|idea    # leave a note for the next agent (no hand-editing)
 crumb capture session            # record session end (git-prefilled); updates handoff + current
 crumb resume                     # print a bounded resume packet with computed staleness
 crumb search "auth middleware"   # deterministic keyword/tag/file lookup over records
 crumb guard "rewrite the auth middleware"   # warn before repeating a known mistake
 crumb audit                      # heuristic health/safety report (stale/unsafe/bloated)
 crumb scan-secrets               # block if committed memory holds token-like strings
+crumb doctor                     # is memory actually wired into your agent?
+crumb mcp serve | register       # run / register the optional MCP server
 ```
 
 In this build, `init`, `validate`, `remember`, `capture session`, `resume`,
@@ -132,6 +137,12 @@ python crumb.py init --force                           # overwrite an existing s
 writes `manifest.yml` (recording the chosen tracking policies), and inserts a
 managed block into the project `.gitignore`. It runs on non-git folders too,
 printing a notice that git-derived record fields will use defined sentinels.
+
+On a terminal, `init` also offers to wire the store into your agent (inject a
+signpost into `CLAUDE.md`/`AGENTS.md`, register the MCP server, install hooks).
+Default non-interactive `init` touches none of those and prints a one-line nudge.
+See **Integrations** below; flags: `--with-adapter`/`--with-mcp`/`--with-hooks`
+(and `--no-*`), `--print-integrations` (dry run), `--remove-integrations`.
 
 ### `crumb validate`
 
@@ -170,6 +181,38 @@ in a terminal for an interactive prompt. A decision/attempt **must** carry
 evidence or `--confidence low` (validate §16.9) — the command enforces this and
 refuses to write an invalid record. `--json` emits a machine summary.
 
+`remember attempt` also accepts the fixed attempt vocabulary as **named flags**
+(`--problem`, `--tried`, `--result`, `--why`, `--do-not-retry`, `--related`), so
+the contract is visible in `--help` instead of discoverable only by rejection.
+
+### `crumb schema`
+
+```bash
+python crumb.py schema                       # the full record contract (human)
+python crumb.py schema attempt --json        # one record type, machine-readable
+python crumb.py schema attempt --template    # a copy-pasteable `remember` skeleton
+```
+
+`schema` prints the record contract — body sections per type, required/derived
+frontmatter, status/privacy/confidence vocabularies, and the evidence-or-low-
+confidence rule — straight from the source constants, with no `.project-memory/`
+required. `--template <type>` emits a fill-in command so an agent reads the
+contract once instead of probing `--help` repeatedly.
+
+### `crumb note question | trap | idea`
+
+```bash
+python crumb.py note question "Should age signals gate compliance?" --why "blocks export"
+python crumb.py note trap "gradlew --stop corrupts R.jar lock" --area build --safe "kill by pid"
+python crumb.py note idea "cache the resume packet" --set Idea "memoize across sessions"
+```
+
+`note` is the write-surface for the three record kinds that previously had no
+command: open questions, known traps, and ideas. `question`/`trap` append a
+parse-verified block to `open-questions.md` / `known-traps.md`; `idea` writes a
+validated record under `ideas/`. Each refreshes `generated/resume-packet.md` so
+the projection never lags the note. Mirrored over MCP as the `memory_note` tool.
+
 ### `crumb capture session`
 
 ```bash
@@ -178,8 +221,10 @@ python crumb.py capture session --fast --next "tired — resume here"    # ~15s,
 ```
 
 `capture session` reads git since the last session record and pre-fills **Work
-Completed** (`git log`), **Files Touched** (`git diff --stat`), then asks only for
-narrative confirmation + a required **Next Action**. It writes the session record
+Completed** (`git log`), **Files Touched** (a one-line `git diff --shortstat`
+summary — `N files changed, +X/-Y`, not an inlined per-file list, so records stay
+small and the secret scanner never trips on path-shaped tokens), then asks only
+for narrative confirmation + a required **Next Action**. It writes the session record
 and refreshes `handoff.md` and `current.md`. `--fast` skips all prompts and any
 LLM, writing a git snapshot + the one-line `--next`. No path requires an LLM.
 With `session_tracking: distillate`, the session file is written locally but stays
@@ -264,6 +309,47 @@ be tuned from dogfood feedback without rearchitecting.
 
 ---
 
+## Integrations — make the store actually get used
+
+A memory store only helps if the agent consults it. `crumb init` can wire the
+store into your agent so it does — every edit is fenced and reversible:
+
+```bash
+crumb init --with-adapter --with-mcp --with-hooks   # all three (non-interactive)
+crumb init --print-integrations                     # dry run: show what would change
+crumb init --remove-integrations                    # cleanly reverse everything
+crumb doctor                                        # is memory wired up? (exit 1 if not)
+```
+
+On a terminal with no integration flags, `init` asks once per integration. Each
+piece is independent:
+
+- **Adapter signpost** (`--with-adapter[=CLAUDE.md,AGENTS.md]`) — injects a small
+  managed block into the agent-guidance files that already exist, telling the
+  agent to read the resume packet, `guard` before risky actions, and `note`/
+  `capture` as it goes. It never creates a file you don't already have, and stays
+  well under the bloat threshold so `audit` stays green.
+- **MCP registration** (`--with-mcp`) — merges a `breadcrumbs` server into
+  `.mcp.json` (preserving any other servers). Needs the optional `[mcp]` extra to
+  actually run: `pip install "crumb-kit[mcp]"`.
+- **Claude Code hooks** (`--with-hooks[=session,guard,capture]`) — merges three
+  hooks into `.claude/settings.json` so memory is consulted **without the agent
+  choosing to**:
+  - `SessionStart → crumb hook session` loads the resume packet as context.
+  - `PreToolUse → crumb hook guard` runs a cost-aware guard before risky Bash/Edit
+    calls (a cheap local risk pre-filter keeps the common path free of record
+    I/O); it surfaces matched memory as context but **never denies from memory
+    alone** — `PROCEED`→allow, `READ_FIRST`/`PAUSE`→allow+context, `ASK_HUMAN`→ask.
+  - `Stop → crumb hook capture` snapshots a session record when the turn ends.
+
+`crumb doctor` reports whether each piece is in place (and whether the resume
+packet is stale), exiting non-zero when a store exists but nothing is wired up.
+
+`crumb mcp serve` runs the server over stdio (same as `breadcrumbs-mcp`); `crumb
+mcp register` is the standalone form of `--with-mcp`.
+
+---
+
 ## Plain-file fallback (cloud agents, no CLI)
 
 The tool degrades gracefully when `crumb` cannot run (e.g. a read-only cloud
@@ -296,16 +382,22 @@ regenerated; `audit` flags this drift by comparing the packet's stamped
 | `guard` (deterministic ranking, §11 verdicts) | implemented (Phase 5) |
 | `audit` (heuristic: secrets, instruction-like, drift, staleness, bloat) | implemented (Phase 6 — **MVP-trust**) |
 | `scan-secrets` (committed-memory secret gate) | implemented (Phase 6) |
+| `schema` (record contract introspection + template) | implemented |
+| `note question` / `note trap` / `note idea` (write-surface) | implemented |
 | `pipx`/`pip` packaging (`crumb` console script, bundled templates) | implemented (Phase 7) |
-| MCP server (`breadcrumbs-mcp`: 8 resources, 6 prompts, 7 tools) | implemented (Phase 8 — **optional**) |
+| MCP server (`breadcrumbs-mcp`: 8 resources, 6 prompts, 8 tools) | implemented (Phase 8 — **optional**) |
+| Integrations: `init` bootstrapper, `doctor`, `mcp`, `hook` (adapter + `.mcp.json` + hooks) | implemented |
 
 With Phase 6 the full MVP (capture → resume → trust) is complete and CI-guarded;
 Phase 7 packages it as a `pipx`-installable `crumb` binary (see **Install**
 above). Phase 8 adds an **optional** MCP server (`pip install
 "crumb-kit[mcp]"`) that exposes the same memory engine to agents without
 shelling out — a thin wrapper over the Phase 1–6 functions, never required for
-baseline use. See [`docs/`](docs/) for the architecture, record schema, CLI spec,
-[MCP spec](docs/mcp-spec.md), and security posture.
+baseline use. The **Integrations** layer (`crumb init --with-*`, `crumb doctor`,
+`crumb hook`) wires that engine into your agent so the store is consulted
+automatically rather than only when an agent remembers to. See [`docs/`](docs/)
+for the architecture, record schema, CLI spec, [MCP spec](docs/mcp-spec.md), and
+security posture.
 
 ---
 

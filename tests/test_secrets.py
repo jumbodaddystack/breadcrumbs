@@ -153,6 +153,36 @@ class FalsePositiveTests(unittest.TestCase):
             (mem / "decisions" / "2026-06-25-z.md").write_text(token + "\n", encoding="utf-8")
             self.assertIn("high-entropy-string", patterns_hit(mem))
 
+    def test_camelcase_paths_and_identifiers_are_not_secrets(self):
+        """Path- and dotted-identifier-shaped tokens are allowlisted (review §6.4)."""
+        allowlisted = (
+            "app/src/main/java/com/MigrationV14ToV15Test",
+            "com.example.config.DatabaseMigrationHelperV2Factory",
+            "src/test/AndroidManifestV2InstrumentationRunner",
+        )
+        for tok in allowlisted:
+            self.assertFalse(
+                crumb._looks_high_entropy(tok), f"{tok} should not read as a secret"
+            )
+            with tempfile.TemporaryDirectory() as tmp:
+                mem = fresh_store(tmp)
+                (mem / "decisions" / "2026-06-25-p.md").write_text(tok + "\n", encoding="utf-8")
+                self.assertNotIn("high-entropy-string", patterns_hit(mem), tok)
+
+    def test_allowlist_does_not_launder_real_blobs(self):
+        """The allowlist must not weaken detection — these still flag."""
+        # A separatorless blob, a base64 blob with embedded '/' and a long random
+        # segment, and a base64 token with '=' padding all stay flagged.
+        still_secret = (
+            "aB3xYz9QdE7Lm2Pq8Rt6Vw1Nc4Kf0Gh5Js7Tb2Zx",
+            "abc/aB3xYz9QdE7Lm2Pq8Rt6Vw1Nc4Kf0Gh5Js7Tb2Zx",
+            "aB3xYz9QdE7Lm2Pq8Rt6Vw1Nc4Kf0Gh5Js7Tb2Zx==",
+        )
+        for tok in still_secret:
+            self.assertTrue(
+                crumb._looks_high_entropy(tok), f"{tok} must still read as a secret"
+            )
+
 
 # --------------------------------------------------------------------------- #
 # Skip rules — private/index/generated are not scanned

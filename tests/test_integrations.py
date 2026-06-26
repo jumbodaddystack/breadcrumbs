@@ -1,0 +1,194 @@
+"""Tests for the `crumb init` bootstrapper (review §5/§7): adapter block, .mcp.json,
+hooks, flags, dry-run, and reversal.
+
+Run with:  python -m pytest tests/
+       or:  python tests/test_integrations.py
+"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+import crumb  # noqa: E402
+
+
+def run(argv: list[str]) -> tuple[int, str]:
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = crumb.main(argv)
+    return code, buf.getvalue()
+
+
+class ManagedBlockTests(unittest.TestCase):
+    def test_insert_replace_remove_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "CLAUDE.md"
+            p.write_text("# Title\n\nuser text\n", encoding="utf-8")
+            crumb.write_adapter_block(Path(tmp), "CLAUDE.md")
+            after = p.read_text()
+            self.assertIn("Project memory (breadcrumbs)", after)
+            self.assertIn("user text", after)
+            # idempotent: re-running keeps exactly one block
+            crumb.write_adapter_block(Path(tmp), "CLAUDE.md")
+            self.assertEqual(p.read_text().count("breadcrumbs managed block (managed"), 1)
+            # removal restores original content
+            self.assertTrue(crumb.remove_adapter_block(Path(tmp), "CLAUDE.md"))
+            self.assertEqual(p.read_text(), "# Title\n\nuser text\n")
+
+    def test_adapter_block_under_bloat_threshold(self):
+        self.assertLess(len(crumb.adapter_block()), crumb.ADAPTER_BLOAT_CHARS)
+
+
+class MergeJsonTests(unittest.TestCase):
+    def test_mcp_register_preserves_siblings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".mcp.json").write_text(
+                json.dumps({"mcpServers": {"other": {"command": "x"}}, "k": 1}),
+                encoding="utf-8",
+            )
+            crumb.register_mcp(root)
+            data = json.loads((root / ".mcp.json").read_text())
+            self.assertIn("other", data["mcpServers"])
+            self.assertIn("breadcrumbs", data["mcpServers"])
+            self.assertEqual(data["k"], 1)
+            self.assertEqual(data["mcpServers"]["breadcrumbs"]["type"], "stdio")
+
+    def test_unregister_only_removes_breadcrumbs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            crumb.register_mcp(root)
+            # add a sibling, then unregister breadcrumbs
+            data = json.loads((root / ".mcp.json").read_text())
+            data["mcpServers"]["other"] = {"command": "x"}
+            (root / ".mcp.json").write_text(json.dumps(data), encoding="utf-8")
+            self.assertTrue(crumb.unregister_mcp(root))
+            data = json.loads((root / ".mcp.json").read_text())
+            self.assertNotIn("breadcrumbs", data["mcpServers"])
+            self.assertIn("other", data["mcpServers"])
+
+    def test_merge_rejects_non_object_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / ".mcp.json"
+            p.write_text("[1, 2, 3]", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                crumb.register_mcp(Path(tmp))
+
+
+class HookMergeTests(unittest.TestCase):
+    def test_install_preserves_foreign_hooks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".claude").mkdir()
+            (root / ".claude" / "settings.json").write_text(
+                json.dumps({"hooks": {"PreToolUse": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "mine"}]}
+                ]}}),
+                encoding="utf-8",
+            )
+            crumb.install_claude_hooks(root, list(crumb.HOOK_EVENTS))
+            data = json.loads((root / ".claude" / "settings.json").read_text())
+            cmds = [h["command"] for g in data["hooks"]["PreToolUse"] for h in g["hooks"]]
+            self.assertIn("mine", cmds)
+            self.assertIn("crumb hook guard", cmds)
+            self.assertIn("SessionStart", data["hooks"])
+            self.assertIn("Stop", data["hooks"])
+
+    def test_install_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            crumb.install_claude_hooks(root, list(crumb.HOOK_EVENTS))
+            crumb.install_claude_hooks(root, list(crumb.HOOK_EVENTS))
+            data = json.loads((root / ".claude" / "settings.json").read_text())
+            self.assertEqual(len(data["hooks"]["PreToolUse"]), 1)
+
+    def test_remove_only_strips_breadcrumbs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".claude").mkdir()
+            (root / ".claude" / "settings.json").write_text(
+                json.dumps({"hooks": {"PreToolUse": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "mine"}]}
+                ]}}),
+                encoding="utf-8",
+            )
+            crumb.install_claude_hooks(root, list(crumb.HOOK_EVENTS))
+            self.assertTrue(crumb.remove_claude_hooks(root))
+            data = json.loads((root / ".claude" / "settings.json").read_text())
+            cmds = [h["command"] for g in data["hooks"].get("PreToolUse", []) for h in g["hooks"]]
+            self.assertEqual(cmds, ["mine"])
+            self.assertNotIn("SessionStart", data["hooks"])
+
+
+class InitFlagTests(unittest.TestCase):
+    def test_default_init_writes_no_integrations(self):
+        # Non-interactive default must stay byte-identical to before (no adapter/mcp/hooks).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "CLAUDE.md").write_text("# x\n", encoding="utf-8")
+            run(["init", "--project", tmp, "--session-tracking", "full"])
+            self.assertNotIn("breadcrumbs managed", (root / "CLAUDE.md").read_text())
+            self.assertFalse((root / ".mcp.json").exists())
+            self.assertFalse((root / ".claude" / "settings.json").exists())
+
+    def test_with_flags_apply_detected_adapter_and_mcp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "CLAUDE.md").write_text("# x\n", encoding="utf-8")
+            code, _ = run([
+                "init", "--project", tmp, "--session-tracking", "full",
+                "--with-adapter", "--with-mcp", "--no-hooks",
+            ])
+            self.assertEqual(code, 0)
+            self.assertIn("breadcrumbs managed", (root / "CLAUDE.md").read_text())
+            self.assertTrue((root / ".mcp.json").exists())
+            self.assertFalse((root / ".claude" / "settings.json").exists())
+
+    def test_no_adapter_file_means_nothing_created(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run(["init", "--project", tmp, "--session-tracking", "full", "--with-adapter"])
+            # we never CREATE an adapter file that didn't exist
+            self.assertFalse((root / "CLAUDE.md").exists())
+
+    def test_print_integrations_is_dry_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "CLAUDE.md").write_text("# x\n", encoding="utf-8")
+            run(["init", "--project", tmp, "--session-tracking", "full"])
+            code, out = run([
+                "init", "--project", tmp, "--print-integrations",
+                "--with-adapter", "--with-mcp", "--json",
+            ])
+            self.assertEqual(code, 0)
+            payload = json.loads(out)
+            self.assertEqual(payload["would_apply"]["adapters"], ["CLAUDE.md"])
+            self.assertTrue(payload["would_apply"]["mcp"])
+            # dry run wrote nothing
+            self.assertNotIn("breadcrumbs managed", (root / "CLAUDE.md").read_text())
+
+    def test_remove_integrations_reverses_everything(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "CLAUDE.md").write_text("# keep me\n", encoding="utf-8")
+            run([
+                "init", "--project", tmp, "--session-tracking", "full",
+                "--with-adapter", "--with-mcp", "--with-hooks",
+            ])
+            run(["init", "--project", tmp, "--remove-integrations"])
+            self.assertEqual((root / "CLAUDE.md").read_text(), "# keep me\n")
+            mcp = json.loads((root / ".mcp.json").read_text())
+            self.assertNotIn("breadcrumbs", mcp.get("mcpServers", {}))
+
+
+if __name__ == "__main__":
+    unittest.main()
