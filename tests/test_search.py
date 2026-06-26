@@ -1,0 +1,126 @@
+"""Tests for `crumb search` — deterministic exact/keyword/tag/file lookup (Phase 5).
+
+Run with:  python -m pytest tests/
+       or:  python -m unittest discover -s tests
+       or:  python tests/test_search.py
+
+Search is the permissive lookup layer (min_keyword=1); `guard` is the cautious
+gate built on top of it (tested in test_guard.py). No embeddings — every result
+is an exact text / tag / file-path / component overlap, and the same input always
+produces the same output.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import shutil
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+import crumb  # noqa: E402
+
+FIXTURES = REPO_ROOT / "fixtures"
+
+
+def run(argv: list[str]) -> tuple[int, str]:
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = crumb.main(argv)
+    return code, buf.getvalue()
+
+
+def copy_fixture(name: str, dest_parent: str) -> Path:
+    """Copy a committed fixture's .project-memory into a NON-git tmp dir.
+
+    A plain copy yields the (no-git) sentinels, so assertions are about content,
+    not this repo's branch/commit (mirrors test_resume.copy_fixture)."""
+    dest = Path(dest_parent)
+    shutil.copytree(FIXTURES / name / ".project-memory", dest / crumb.MEMORY_DIRNAME)
+    return dest
+
+
+class SearchSignalTests(unittest.TestCase):
+    """A match must come from a real signal: text, tag, or file path."""
+
+    def test_keyword_match_returns_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = copy_fixture("fixture-02-guard-true-positive", tmp)
+            code, out = run(["search", "auth middleware", "--project", str(root), "--json"])
+            self.assertEqual(code, 0)
+            ids = {m["id"] for m in json.loads(out)["matches"]}
+            self.assertIn("att_20260612_auth-middleware-rewrite", ids)
+
+    def test_tag_filter_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = copy_fixture("fixture-02-guard-true-positive", tmp)
+            code, out = run(["search", "--tag", "session", "--project", str(root), "--json"])
+            self.assertEqual(code, 0)
+            ids = {m["id"] for m in json.loads(out)["matches"]}
+            self.assertIn("dec_20260610_session-parser-contract", ids)
+            self.assertNotIn("att_20260612_auth-middleware-rewrite", ids)
+
+    def test_file_path_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = copy_fixture("fixture-02-guard-true-positive", tmp)
+            code, out = run(["search", "src/auth/middleware.ts", "--project", str(root), "--json"])
+            self.assertEqual(code, 0)
+            matches = json.loads(out)["matches"]
+            top = matches[0]
+            self.assertEqual(top["id"], "att_20260612_auth-middleware-rewrite")
+            self.assertIn("file", top["signals"])
+
+    def test_type_filter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = copy_fixture("fixture-02-guard-true-positive", tmp)
+            _, out = run(["search", "auth", "--type", "attempt", "--project", str(root), "--json"])
+            kinds = {m["kind"] for m in json.loads(out)["matches"]}
+            self.assertEqual(kinds, {"attempt"})
+
+    def test_unrelated_query_returns_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = copy_fixture("fixture-02-guard-true-positive", tmp)
+            _, out = run(["search", "kubernetes helm chart", "--project", str(root), "--json"])
+            self.assertEqual(json.loads(out)["matches"], [])
+
+    def test_superseded_records_are_searchable(self):
+        """Search is a lookup; it finds superseded records too (guard demotes them)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = copy_fixture("fixture-05-superseded-decision", tmp)
+            _, out = run(["search", "auth token", "--project", str(root), "--json"])
+            by_id = {m["id"]: m for m in json.loads(out)["matches"]}
+            self.assertIn("dec_20260501_auth-token-in-url", by_id)
+            self.assertEqual(by_id["dec_20260501_auth-token-in-url"]["status"], "superseded")
+
+
+class DeterminismTests(unittest.TestCase):
+    def test_same_input_same_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = copy_fixture("fixture-02-guard-true-positive", tmp)
+            _, a = run(["search", "auth session", "--project", str(root), "--json"])
+            _, b = run(["search", "auth session", "--project", str(root), "--json"])
+            self.assertEqual(a, b)
+
+
+class HumanOutputTests(unittest.TestCase):
+    def test_human_output_lists_ids_and_scores(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = copy_fixture("fixture-02-guard-true-positive", tmp)
+            _, out = run(["search", "auth middleware", "--project", str(root)])
+            self.assertIn("att_20260612_auth-middleware-rewrite", out)
+            self.assertIn("score", out)
+
+    def test_no_memory_errors_cleanly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, _ = run(["search", "anything", "--project", tmp])
+            self.assertEqual(code, 2)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

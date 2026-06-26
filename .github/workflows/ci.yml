@@ -1,0 +1,181 @@
+name: ci
+
+# Phase 4 (MVP-core / 19a): run the deterministic test suite plus `validate`
+# and Fixture 1 (fresh resume) on every push/PR.
+# Phase 5 wires Fixtures 2–5 (guard true positive / false-positive control /
+# stale handoff / superseded).
+# Phase 6 (MVP-trust / 19b): adds `audit` + Fixtures 6–10 and runs `validate`
+# AND `audit` across all ten fixtures (§19b.11). Only the secret fixture (6)
+# is expected to make `audit` block; every fixture must `validate` clean.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Standard library only — no install step, no third-party deps.
+      - name: Unit tests (stdlib unittest)
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+
+      - name: validate Fixture 1
+        run: python crumb.py validate --project fixtures/fixture-01-fresh-resume
+
+      - name: resume answers Fixture 1's six questions
+        run: |
+          python crumb.py resume --project fixtures/fixture-01-fresh-resume --json > /tmp/packet.json
+          python - <<'PY'
+          import json
+          p = json.load(open("/tmp/packet.json"))
+          # 1 project, 2 active, 3 decided, 4 failed, 5 next, 6 do-not-retry
+          assert p["project"]["name"] == "demo-service", p["project"]
+          ids = [d["id"] for d in p["active_decisions"]]
+          assert "dec_20260510_markdown-source-of-truth" in ids, ids
+          assert any("vendor lock-in" in d["rationale"] for d in p["active_decisions"])
+          atts = [a["id"] for a in p["failed_attempts"]]
+          assert "att_20260512_sqlite-store-too-heavy" in atts, atts
+          assert "build_resume_packet" in p["next_action"], p["next_action"]
+          assert any("plain-file export is automatic" in a["do_not_retry"] for a in p["failed_attempts"])
+          assert p["approx_tokens"] <= 5000, p["approx_tokens"]
+          print("Fixture 1: all six questions answered; packet within budget.")
+          PY
+
+      - name: validate Fixtures 2-10 (every fixture is structurally well-formed)
+        run: |
+          for f in fixtures/fixture-0[2-9]-* fixtures/fixture-10-*; do
+            python crumb.py validate --project "$f"
+          done
+
+      - name: guard fixtures behave (true positive / false-positive control)
+        run: |
+          python crumb.py guard "rewrite the auth middleware to use the new session parser" \
+            --files src/auth/middleware.ts \
+            --project fixtures/fixture-02-guard-true-positive --json > /tmp/g2.json
+          python crumb.py guard "refactor the pooling logic in the worker" \
+            --project fixtures/fixture-03-guard-false-positive --json > /tmp/g3.json
+          python - <<'PY'
+          import json
+          g2 = json.load(open("/tmp/g2.json"))
+          g3 = json.load(open("/tmp/g3.json"))
+          assert g2["verdict"] in ("PAUSE", "READ_FIRST"), g2["verdict"]
+          assert len(g2["matches"]) <= 5
+          assert g3["verdict"] == "PROCEED", g3["verdict"]
+          assert g3["matches"] == [], g3["matches"]
+          print("Fixtures 2/3: guard true-positive fires, false-positive control stays quiet.")
+          PY
+
+      - name: audit Fixtures 1-10 (only the secret fixture blocks)
+        run: |
+          # Every fixture except 6 must audit cleanly (exit 0). Fixture 6 ships a
+          # committed secret, so `audit`/`scan-secrets` MUST block (non-zero).
+          for f in fixtures/fixture-0[1-9]-* fixtures/fixture-10-*; do
+            name="$(basename "$f")"
+            if [ "$name" = "fixture-06-secret-leak" ]; then
+              if python crumb.py audit --project "$f" > /dev/null; then
+                echo "FAIL: audit should have blocked on $name (committed secret)"; exit 1
+              fi
+              if python crumb.py scan-secrets --project "$f" > /dev/null; then
+                echo "FAIL: scan-secrets should have blocked on $name"; exit 1
+              fi
+              echo "$name: audit + scan-secrets correctly blocked on the secret."
+            else
+              python crumb.py audit --project "$f" > /dev/null \
+                && echo "$name: audit clean (warnings/notes only)."
+            fi
+          done
+
+      - name: audit flags the heuristic fixtures (7 instruction-like / 8 drift)
+        run: |
+          python crumb.py audit --project fixtures/fixture-07-poisoned-text --json > /tmp/a7.json
+          python crumb.py audit --project fixtures/fixture-08-packet-stale --json > /tmp/a8.json
+          python - <<'PY'
+          import json
+          a7 = json.load(open("/tmp/a7.json"))
+          a8 = json.load(open("/tmp/a8.json"))
+          checks7 = {f["check"] for f in a7["findings"]}
+          checks8 = {f["check"] for f in a8["findings"]}
+          assert "instruction-like" in checks7, checks7
+          assert "packet-drift" in checks8, checks8
+          print("Fixtures 7/8: audit flags instruction-like text and generated-packet drift.")
+          PY
+
+  # Phase 7 (packaging / §18 Phase 4): the package must install from source AND
+  # from a built wheel, expose the `crumb` console script, bundle the
+  # templates as package data, and smoke-test every MVP command from the
+  # installed binary — not just `python crumb.py`.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build wheel + sdist
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Bundled templates present in the wheel (17 files incl. 4 .gitkeep)
+        run: |
+          WHEEL="$(ls dist/breadcrumbs-*.whl)"
+          echo "wheel: $WHEEL"
+          n_tmpl="$(python -m zipfile -l "$WHEEL" | grep -c 'breadcrumbs/templates/project-memory/')"
+          n_keep="$(python -m zipfile -l "$WHEEL" | grep -c '\.gitkeep')"
+          echo "template entries: $n_tmpl ; .gitkeep entries: $n_keep"
+          test "$n_tmpl" -eq 17
+          test "$n_keep" -eq 4
+
+      - name: Install the built wheel into an isolated venv (mimics pipx)
+        run: |
+          python -m venv /tmp/cv
+          /tmp/cv/bin/python -m pip install "$(ls dist/breadcrumbs-*.whl)"
+
+      - name: Console script + version on PATH
+        run: |
+          /tmp/cv/bin/crumb --version
+          /tmp/cv/bin/crumb --version | grep -E 'breadcrumbs [0-9]+\.[0-9]+\.[0-9]+ \(record schema_version [0-9]+\)'
+
+      - name: Installed-binary smoke test — all MVP commands
+        run: |
+          BIN=/tmp/cv/bin/crumb
+          WORK="$(mktemp -d)"
+          cd "$WORK"
+          git init -q && git config user.email t@t.t && git config user.name t
+          git commit -q --allow-empty -m init
+          # init must locate the BUNDLED templates (no repo-relative path).
+          $BIN init --session-tracking full
+          test -d .project-memory/decisions && test -d .project-memory/sessions
+          $BIN validate
+          $BIN remember decision --title "Use markdown store" \
+            --set Context "tool-independent" --set Decision "md+yaml" \
+            --evidence command "pytest" --tags arch
+          $BIN capture session --fast --next "wire resume"
+          $BIN resume --json > /tmp/r.json
+          $BIN search "markdown" > /dev/null
+          $BIN guard "rewrite the markdown store" --json > /tmp/g.json
+          $BIN audit > /dev/null
+          $BIN scan-secrets > /dev/null
+          python - <<'PY'
+          import json
+          r = json.load(open("/tmp/r.json"))
+          g = json.load(open("/tmp/g.json"))
+          assert r["approx_tokens"] <= 5000, r["approx_tokens"]
+          assert g["verdict"] in ("PROCEED", "READ_FIRST", "PAUSE", "ASK_HUMAN"), g["verdict"]
+          print("Installed binary: init found bundled templates; all MVP commands green.")
+          PY
+
+      - name: Install from source too (pipx install . equivalent)
+        run: |
+          python -m venv /tmp/cv2
+          /tmp/cv2/bin/python -m pip install .
+          /tmp/cv2/bin/crumb --version

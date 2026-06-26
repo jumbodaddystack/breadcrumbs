@@ -1,0 +1,110 @@
+name: release
+
+# Publishes breadcrumbs to PyPI via Trusted Publishing (OIDC) — no API tokens
+# are stored anywhere in this repo. Two paths:
+#
+#   * workflow_dispatch  -> builds, validates, and publishes to TestPyPI
+#                           (a safe dry-run you can `pip install` from before
+#                           claiming the version on real PyPI).
+#   * release published  -> builds, validates, and publishes to real PyPI.
+#
+# One-time setup on each index (PyPI + TestPyPI), done once before the first run:
+#   1. Create the project's "pending publisher" at
+#        https://pypi.org/manage/account/publishing/   (and the test.pypi.org twin)
+#      with: owner = jumbodaddystack, repo = breadcrumbs,
+#             workflow = release.yml, environment = pypi (or testpypi).
+#   2. That's it — no secrets. OIDC mints a short-lived token per run.
+#
+# The build/check job mirrors the `package` job in ci.yml so a release can never
+# ship an artifact CI would have rejected (bundled templates, installed-binary
+# smoke test, twine metadata check).
+
+on:
+  workflow_dispatch:        # manual -> TestPyPI dry-run
+  release:
+    types: [published]      # GitHub release -> real PyPI
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build wheel + sdist
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+
+      - name: Validate metadata (twine check)
+        run: python -m twine check dist/*
+
+      - name: Bundled templates present in the wheel (17 files incl. 4 .gitkeep)
+        run: |
+          WHEEL="$(ls dist/breadcrumbs-*.whl)"
+          n_tmpl="$(python -m zipfile -l "$WHEEL" | grep -c 'breadcrumbs/templates/project-memory/')"
+          n_keep="$(python -m zipfile -l "$WHEEL" | grep -c '\.gitkeep')"
+          test "$n_tmpl" -eq 17
+          test "$n_keep" -eq 4
+
+      - name: Installed-binary smoke test (mimics pipx)
+        run: |
+          python -m venv /tmp/cv
+          /tmp/cv/bin/python -m pip install "$(ls dist/breadcrumbs-*.whl)"
+          /tmp/cv/bin/crumb --version | grep -E 'breadcrumbs [0-9]+\.[0-9]+\.[0-9]+ \(record schema_version [0-9]+\)'
+          WORK="$(mktemp -d)"; cd "$WORK"
+          git init -q && git config user.email t@t.t && git config user.name t
+          git commit -q --allow-empty -m init
+          /tmp/cv/bin/crumb init --session-tracking full
+          /tmp/cv/bin/crumb validate
+
+      - name: Upload built distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish-testpypi:
+    # Manual dry-run only. Verify `pip install -i https://test.pypi.org/simple/ breadcrumbs`
+    # works end-to-end before publishing to real PyPI.
+    if: github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/breadcrumbs
+    permissions:
+      id-token: write        # required for Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist/
+
+  publish-pypi:
+    # Real publish, only when a GitHub release is published.
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/breadcrumbs
+    permissions:
+      id-token: write        # required for Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
