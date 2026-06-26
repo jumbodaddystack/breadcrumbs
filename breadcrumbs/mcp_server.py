@@ -12,7 +12,7 @@ Graceful degradation (plan §3, §13 "MCP later"):
   * Nothing here is required for baseline use: the CLI and plain files provide the
     same information and writes without any MCP runtime.
 
-Install the optional runtime with:  ``pip install "breadcrumbs[mcp]"``
+Install the optional runtime with:  ``pip install "crumb-kit[mcp]"``
 Run it with:                         ``python -m breadcrumbs.mcp_server``
                                 or:  ``breadcrumbs-mcp``
 
@@ -42,7 +42,7 @@ except ImportError as exc:  # pragma: no cover - exercised only without the SDK
 SERVER_NAME = "breadcrumbs"
 _INSTALL_HINT = (
     "The MCP server needs the optional Python MCP SDK.\n"
-    '  pip install "breadcrumbs[mcp]"   (or:  pip install mcp)\n'
+    '  pip install "crumb-kit[mcp]"   (or:  pip install mcp)\n'
     "Everything still works without it via the `crumb` CLI and the plain\n"
     f"{mcp_core.MEMORY_DIRNAME}/ files — MCP is an optional interop layer."
 )

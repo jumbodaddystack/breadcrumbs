@@ -3379,7 +3379,7 @@ def get_version() -> str:
     try:
         from importlib.metadata import PackageNotFoundError, version
         try:
-            return version("breadcrumbs")
+            return version("crumb-kit")
         except PackageNotFoundError:
             return _FALLBACK_VERSION
     except Exception:  # pragma: no cover - importlib.metadata always present on 3.8+

@@ -19,7 +19,7 @@ The workflow lives at [`.github/workflows/release.yml`](.github/workflows/releas
 1. Go to **https://pypi.org/manage/account/publishing/** (and, for the dry-run,
    the twin at **https://test.pypi.org/manage/account/publishing/**).
 2. Add a **pending publisher** with:
-   - **PyPI project name:** `breadcrumbs`
+   - **PyPI project name:** `crumb-kit`
    - **Owner:** `jumbodaddystack`
    - **Repository:** `breadcrumbs`
    - **Workflow name:** `release.yml`
@@ -38,11 +38,11 @@ runs the same checks CI does, and publishes to **TestPyPI**. Verify the install:
 
 ```bash
 pipx install --index-url https://test.pypi.org/simple/ \
-             --pip-args="--extra-index-url https://pypi.org/simple/" breadcrumbs
+             --pip-args="--extra-index-url https://pypi.org/simple/" crumb-kit
 crumb --version
 ```
 
-(The extra index lets pip resolve any real deps; breadcrumbs itself has none.)
+(The extra index lets pip resolve any real deps; crumb-kit itself has none.)
 
 ### Publish to real PyPI
 
@@ -59,7 +59,7 @@ git push origin v0.1.0
 After it runs, confirm:
 
 ```bash
-pipx install breadcrumbs
+pipx install crumb-kit
 crumb --version
 ```
 

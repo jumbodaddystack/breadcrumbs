@@ -1,6 +1,6 @@
 name: release
 
-# Publishes breadcrumbs to PyPI via Trusted Publishing (OIDC) — no API tokens
+# Publishes the Breadcrumbs package (PyPI name: crumb-kit) to PyPI via Trusted Publishing (OIDC) — no API tokens
 # are stored anywhere in this repo. Two paths:
 #
 #   * workflow_dispatch  -> builds, validates, and publishes to TestPyPI
@@ -44,7 +44,7 @@ jobs:
 
       - name: Bundled templates present in the wheel (17 files incl. 4 .gitkeep)
         run: |
-          WHEEL="$(ls dist/breadcrumbs-*.whl)"
+          WHEEL="$(ls dist/crumb_kit-*.whl)"
           n_tmpl="$(python -m zipfile -l "$WHEEL" | grep -c 'breadcrumbs/templates/project-memory/')"
           n_keep="$(python -m zipfile -l "$WHEEL" | grep -c '\.gitkeep')"
           test "$n_tmpl" -eq 17
@@ -53,7 +53,7 @@ jobs:
       - name: Installed-binary smoke test (mimics pipx)
         run: |
           python -m venv /tmp/cv
-          /tmp/cv/bin/python -m pip install "$(ls dist/breadcrumbs-*.whl)"
+          /tmp/cv/bin/python -m pip install "$(ls dist/crumb_kit-*.whl)"
           /tmp/cv/bin/crumb --version | grep -E 'breadcrumbs [0-9]+\.[0-9]+\.[0-9]+ \(record schema_version [0-9]+\)'
           WORK="$(mktemp -d)"; cd "$WORK"
           git init -q && git config user.email t@t.t && git config user.name t
@@ -68,14 +68,14 @@ jobs:
           path: dist/
 
   publish-testpypi:
-    # Manual dry-run only. Verify `pip install -i https://test.pypi.org/simple/ breadcrumbs`
+    # Manual dry-run only. Verify `pip install -i https://test.pypi.org/simple/ crumb-kit`
     # works end-to-end before publishing to real PyPI.
     if: github.event_name == 'workflow_dispatch'
     needs: build
     runs-on: ubuntu-latest
     environment:
       name: testpypi
-      url: https://test.pypi.org/p/breadcrumbs
+      url: https://test.pypi.org/p/crumb-kit
     permissions:
       id-token: write        # required for Trusted Publishing (OIDC)
     steps:
@@ -96,7 +96,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/breadcrumbs
+      url: https://pypi.org/p/crumb-kit
     permissions:
       id-token: write        # required for Trusted Publishing (OIDC)
     steps:
