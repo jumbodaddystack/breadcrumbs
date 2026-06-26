@@ -3386,15 +3386,45 @@ def get_version() -> str:
         return _FALLBACK_VERSION
 
 
+# Global flags live on a shared parent parser inherited by every subparser, so
+# they can be passed either before or after the subcommand. The catch: argparse's
+# subparser action (_SubParsersAction.__call__) parses the subcommand into a
+# *fresh* namespace and copies its keys back over the parent namespace — which
+# clobbers any global a user set before the subcommand (issue #3). Two-part fix:
+#   1. The shared globals default to SUPPRESS, so an absent flag never lands in
+#      the sub-namespace and therefore never overwrites the parent's value.
+#   2. The top-level parser backfills the real defaults once, after parsing.
+# Subparsers stay plain argparse.ArgumentParser (see add_subparsers below) so the
+# backfill happens exactly once, at the top — never inside a sub-namespace that
+# would then be copied back.
+_GLOBAL_FLAG_DEFAULTS = {"project": None, "json": False, "plain": False, "verbose": False}
+
+
+class _BreadcrumbsParser(argparse.ArgumentParser):
+    """Top-level parser that keeps global flags working in any position."""
+
+    def parse_known_args(self, args=None, namespace=None):
+        ns, argv = super().parse_known_args(args, namespace)
+        for dest, default in _GLOBAL_FLAG_DEFAULTS.items():
+            if not hasattr(ns, dest):
+                setattr(ns, dest, default)
+        return ns, argv
+
+
 def build_parser() -> argparse.ArgumentParser:
     # Parent parser holds the global flags so every subcommand inherits them.
+    # default=SUPPRESS is load-bearing — see _BreadcrumbsParser above.
     global_parser = argparse.ArgumentParser(add_help=False)
-    global_parser.add_argument("--json", action="store_true", help="machine-readable JSON output")
-    global_parser.add_argument("--plain", action="store_true", help="plain-text output (no decoration)")
-    global_parser.add_argument("--verbose", action="store_true", help="verbose output")
-    global_parser.add_argument("--project", metavar="PATH", help="project root (default: cwd)")
+    global_parser.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                               help="machine-readable JSON output")
+    global_parser.add_argument("--plain", action="store_true", default=argparse.SUPPRESS,
+                               help="plain-text output (no decoration)")
+    global_parser.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS,
+                               help="verbose output")
+    global_parser.add_argument("--project", metavar="PATH", default=argparse.SUPPRESS,
+                               help="project root (default: cwd)")
 
-    parser = argparse.ArgumentParser(
+    parser = _BreadcrumbsParser(
         prog="crumb",
         description="Breadcrumbs — a repo-local ledger of durable project state you and your agents can follow back.",
         parents=[global_parser],
@@ -3408,7 +3438,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         help="show version and record schema_version, then exit",
     )
-    sub = parser.add_subparsers(dest="command", metavar="<command>")
+    # Subparsers are plain ArgumentParsers (not _BreadcrumbsParser) so the global
+    # backfill runs only once, at the top level — never in a copied-back sub-namespace.
+    sub = parser.add_subparsers(dest="command", metavar="<command>",
+                                parser_class=argparse.ArgumentParser)
 
     # init
     p_init = sub.add_parser(

@@ -127,5 +127,67 @@ class RecordModelTests(unittest.TestCase):
             self.assertEqual([r.rtype for r in only_dec], ["decision"])
 
 
+class GlobalFlagPositionTests(unittest.TestCase):
+    """Global flags must work whether placed BEFORE or AFTER the subcommand.
+
+    Regression test for issue #3. The parent-parser globals (--project, --json,
+    --plain, --verbose) were silently dropped when placed before the subcommand
+    because argparse's _SubParsersAction.__call__ parses the subcommand into a
+    fresh namespace and copies the subparser's *defaults* back over values the
+    top-level parser already set.
+    """
+
+    def _parse(self, argv):
+        return crumb.build_parser().parse_args(argv)
+
+    def test_project_honored_before_subcommand(self):
+        args = self._parse(["--project", "/tmp/store", "validate"])
+        self.assertEqual(args.project, "/tmp/store")
+
+    def test_project_honored_after_subcommand(self):
+        args = self._parse(["validate", "--project", "/tmp/store"])
+        self.assertEqual(args.project, "/tmp/store")
+
+    def test_project_honored_before_nested_subcommand(self):
+        args = self._parse(
+            ["--project", "/tmp/store", "remember", "decision", "--title", "x"]
+        )
+        self.assertEqual(args.project, "/tmp/store")
+
+    def test_json_honored_before_subcommand(self):
+        self.assertTrue(self._parse(["--json", "validate"]).json)
+
+    def test_verbose_honored_before_subcommand(self):
+        self.assertTrue(self._parse(["--verbose", "validate"]).verbose)
+
+    def test_plain_honored_before_subcommand(self):
+        self.assertTrue(self._parse(["--plain", "search", "x"]).plain)
+
+    def test_defaults_present_when_flags_absent(self):
+        args = self._parse(["validate"])
+        self.assertIsNone(args.project)
+        self.assertFalse(args.json)
+        self.assertFalse(args.plain)
+        self.assertFalse(args.verbose)
+
+    def test_global_project_targets_store_from_unrelated_cwd(self):
+        """The real-world bug: from a cwd that is not the project, a global
+        --project must still resolve to the store (not fail on cwd)."""
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            crumb.main(["init", "--project", str(root), "--session-tracking", "full"])
+            saved = os.getcwd()
+            with tempfile.TemporaryDirectory() as other:
+                try:
+                    os.chdir(other)
+                    rc = crumb.main(["--project", str(root), "validate"])
+                finally:
+                    os.chdir(saved)
+            self.assertEqual(rc, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
