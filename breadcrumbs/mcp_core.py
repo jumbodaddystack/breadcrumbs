@@ -106,7 +106,10 @@ def resource_decisions(root: str | Path | None = None) -> str:
 
 def _record_text(memory_dir: Path, rid: str, *, kind: str) -> str:
     rec = cli.find_record_by_id(memory_dir, rid)
-    if rec is None or rec.error:
+    # The id-space is type-prefixed, but enforce the kind explicitly so the
+    # memory://decisions/{id} and memory://attempts/{id} URIs can't serve the
+    # other type's record.
+    if rec is None or rec.error or rec.rtype != kind:
         raise KeyError(f"no {kind} with id {rid!r}")
     return rec.path.read_text(encoding="utf-8")
 

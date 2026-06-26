@@ -33,8 +33,11 @@ from breadcrumbs import mcp_core
 try:  # The SDK is optional; importing this module must never hard-fail.
     from mcp.server.fastmcp import FastMCP
 
-    _SDK_IMPORT_ERROR: ImportError | None = None
-except ImportError as exc:  # pragma: no cover - exercised only without the SDK
+    _SDK_IMPORT_ERROR: Exception | None = None
+except Exception as exc:  # pragma: no cover - exercised only without the SDK
+    # Catch any import-time failure, not just ImportError: a partial or
+    # version-skewed SDK install can raise other errors, and the contract is
+    # that importing this module never hard-fails — it degrades to a clear hint.
     FastMCP = None  # type: ignore[assignment]
     _SDK_IMPORT_ERROR = exc
 
@@ -135,9 +138,15 @@ def build_server():  # -> FastMCP
     # ---------------- Tools (7) — wrap existing functions ------------------ #
 
     @mcp.tool()
-    def memory_search(query: str, filters: dict | None = None) -> dict:
-        """Deterministic search over canonical records (wraps `crumb search`)."""
-        return mcp_core.tool_search(query, filters=filters, root=_root())
+    def memory_search(
+        query: str, filters: dict | None = None, files: list[str] | None = None
+    ) -> dict:
+        """Deterministic search over canonical records (wraps `crumb search`).
+
+        `files` scopes the search to records touching those paths, mirroring the
+        CLI/guard file-overlap support.
+        """
+        return mcp_core.tool_search(query, filters=filters, files=files, root=_root())
 
     @mcp.tool()
     def memory_record(type: str, payload: dict) -> dict:

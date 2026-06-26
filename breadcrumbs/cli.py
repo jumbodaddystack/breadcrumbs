@@ -255,6 +255,10 @@ def cmd_init(args: argparse.Namespace) -> int:
         _emit_error(args, f"project root does not exist: {root}")
         return 2
 
+    if not root.is_dir():
+        _emit_error(args, f"project root is not a directory: {root}")
+        return 2
+
     if memory_dir.exists() and not args.force:
         _emit_error(
             args,
@@ -273,17 +277,28 @@ def cmd_init(args: argparse.Namespace) -> int:
     # Non-git detection (notice only; gitignore is still written for later git init).
     git_present = is_git_repo(root)
 
-    # Build the scaffold.
-    if memory_dir.exists() and args.force:
-        shutil.rmtree(memory_dir)
-    copy_template_tree(memory_dir)
-
+    # Build the new scaffold in a staging dir and swap it in. An existing store
+    # (--force) is destroyed only after the replacement is fully built, so a
+    # missing template or a mid-build failure can never leave the project with a
+    # half-written or deleted .project-memory/.
     project = derive_project_name(root)
     created_at = now_iso()
-    (memory_dir / "manifest.yml").write_text(
-        manifest_content(project, created_at, session_tracking, commit_generated),
-        encoding="utf-8",
-    )
+    staging = root / (MEMORY_DIRNAME + ".new")
+    if staging.exists():
+        shutil.rmtree(staging)
+    try:
+        copy_template_tree(staging)
+        (staging / "manifest.yml").write_text(
+            manifest_content(project, created_at, session_tracking, commit_generated),
+            encoding="utf-8",
+        )
+    except Exception:
+        if staging.exists():
+            shutil.rmtree(staging)
+        raise
+    if memory_dir.exists():
+        shutil.rmtree(memory_dir)
+    staging.rename(memory_dir)
 
     block = gitignore_block(session_tracking, commit_generated)
     write_gitignore(root, block)
@@ -368,8 +383,13 @@ def _parse_scalar(val: str):
     val = val.strip()
     if val == "":
         return None
-    if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
-        return val[1:-1]
+    if val[0] in "\"'":
+        # Quoted scalar: return the content up to the matching closing quote and
+        # ignore anything after it (e.g. a trailing ` # comment`). A `#` *inside*
+        # the quotes is preserved. An unterminated quote falls through to literal.
+        end = val.find(val[0], 1)
+        if end != -1:
+            return val[1:end]
     val = _strip_inline_comment(val)
     if val in ("null", "~"):
         return None
@@ -379,7 +399,13 @@ def _parse_scalar(val: str):
 
 
 def _is_map_item(after_dash: str) -> bool:
-    """A list item is a map if it looks like `key: value` or `key:`."""
+    """A list item is a map if it looks like `key: value` or `key:`.
+
+    A quoted item is always a scalar, even if it contains `: ` — otherwise a
+    tag like `"area: backend"` would be misread as a {key: value} map.
+    """
+    if after_dash[:1] in "\"'":
+        return False
     return ": " in after_dash or after_dash.endswith(":")
 
 
@@ -462,6 +488,10 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
     A document with no leading `---` fence has empty frontmatter and is returned
     verbatim as the body. An opened-but-unterminated fence is malformed.
     """
+    if text.startswith("﻿"):
+        # A UTF-8 BOM survives str.strip(), so it would mask the opening fence
+        # and silently drop the whole frontmatter. Strip a single leading BOM.
+        text = text[1:]
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
         return {}, text
@@ -521,8 +551,16 @@ class Record:
 
     @classmethod
     def from_file(cls, path: Path, rtype: str) -> "Record":
+        # utf-8-sig transparently consumes a BOM. A decode failure or any OS
+        # error (binary file, directory, broken symlink, permissions) is captured
+        # as a Record error — never raised — so a single bad file can't crash the
+        # walk that load_records()/validate run over the whole store.
         try:
-            meta, body = parse_frontmatter(Path(path).read_text(encoding="utf-8"))
+            text = Path(path).read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError) as exc:
+            return cls(path, rtype, meta=None, body="", error=f"unreadable file: {exc}")
+        try:
+            meta, body = parse_frontmatter(text)
         except FrontmatterError as exc:
             return cls(path, rtype, meta=None, body="", error=str(exc))
         return cls(path, rtype, meta=meta, body=body)
@@ -615,6 +653,9 @@ def git_dirty_files(root: Path) -> list[str]:
     for line in out.splitlines():
         # porcelain: 2 status chars + space + path
         path = line[3:].strip() if len(line) > 3 else line.strip()
+        if " -> " in path:
+            # rename/copy entries are "R  old -> new"; record the destination.
+            path = path.split(" -> ", 1)[1].strip()
         if path:
             files.append(path)
     return files
@@ -784,6 +825,13 @@ def run_validate(memory_dir: Path) -> list[dict]:
 
         # 16.7 / 16.8 — privacy placement and prohibition.
         privacy = rec.meta.get("privacy")
+        if privacy is not None and privacy not in VALID_PRIVACY:
+            # A typo'd value (e.g. "secret-prohibitted") must not silently slip
+            # past the exact-match leak gate below — flag the out-of-vocab value.
+            findings.append(
+                _finding("privacy", "fail", rel,
+                         f"invalid privacy {privacy!r} (allowed: {', '.join(VALID_PRIVACY)})")
+            )
         if privacy == "secret-prohibited":
             findings.append(
                 _finding("privacy", "fail", rel, "privacy: secret-prohibited must not be stored in memory")
@@ -995,7 +1043,7 @@ _EMPTY_SECTION = "_(not recorded)_"
 
 # ---- rendering ------------------------------------------------------------- #
 
-def _needs_quote(s: str) -> bool:
+def _needs_quote(s: str, in_list: bool = False) -> bool:
     if s == "":
         return True
     if s in ("null", "~", "[]", "true", "false"):
@@ -1006,10 +1054,15 @@ def _needs_quote(s: str) -> bool:
         return True
     if " #" in s:
         return True
+    # In a block list, a `: ` or trailing `:` would make the parser read the
+    # item as a {key: value} map instead of a scalar (see _is_map_item), so it
+    # must be quoted. At the top level a colon in the value is harmless.
+    if in_list and (": " in s or s.endswith(":")):
+        return True
     return False
 
 
-def _render_scalar(v) -> str:
+def _render_scalar(v, in_list: bool = False) -> str:
     """Render a scalar so it round-trips through `parse_frontmatter`."""
     if v is None:
         return "null"
@@ -1018,7 +1071,12 @@ def _render_scalar(v) -> str:
     if v is False:
         return "false"
     s = str(v)
-    if _needs_quote(s):
+    if "\n" in s or "\r" in s:
+        # The frontmatter is a line-based YAML subset with no multi-line scalar
+        # support: a newline would silently truncate the value and inject the
+        # remainder as bogus keys. Reject it at the source instead of corrupting.
+        raise ValueError("frontmatter values must be single-line (no newlines)")
+    if _needs_quote(s, in_list=in_list):
         q = "'" if '"' in s else '"'
         return f"{q}{s}{q}"
     return s
@@ -1047,7 +1105,7 @@ def render_frontmatter(meta: dict) -> str:
             else:
                 lines.append(f"{key}:")
                 for item in v:
-                    lines.append(f"  - {_render_scalar(item)}")
+                    lines.append(f"  - {_render_scalar(item, in_list=True)}")
         else:
             lines.append(f"{key}: {_render_scalar(v)}")
     lines.append("---")
@@ -1319,20 +1377,25 @@ def cmd_remember(args: argparse.Namespace) -> int:
             )
             return 2
 
-    path, meta = write_record(
-        memory_dir,
-        root,
-        rtype,
-        title,
-        sections,
-        tags=tags,
-        evidence=evidence,
-        confidence=confidence,
-        privacy=args.privacy,
-        scope=args.scope,
-        status=args.status,
-        agent=args.agent,
-    )
+    try:
+        path, meta = write_record(
+            memory_dir,
+            root,
+            rtype,
+            title,
+            sections,
+            tags=tags,
+            evidence=evidence,
+            confidence=confidence,
+            privacy=args.privacy,
+            scope=args.scope,
+            status=args.status,
+            agent=args.agent,
+        )
+    except ValueError as exc:
+        # e.g. a newline in a frontmatter field — rendering refuses to corrupt.
+        _emit_error(args, str(exc))
+        return 2
 
     # Post-write validate gate (defense in depth — fail fast, don't leave a bad file).
     fails = _validate_new_file(memory_dir, path)
@@ -1539,9 +1602,21 @@ def split_md_sections(text: str) -> dict[str, str]:
 
 
 def _is_placeholder(text: str) -> bool:
-    """True for empty content or the angle-bracket template stubs."""
+    """True for empty content, the `<...>` template stubs, or `_(...)_` notes.
+
+    A `<...>` autolink URL (contains `://`) is real content, not a stub. The
+    `_(...)_` italic form is what the capture prefill emits when there is nothing
+    to report (e.g. `_(no new commits)_`) — treating it as a placeholder keeps it
+    from clobbering a previously meaningful section.
+    """
     t = text.strip()
-    return (not t) or (t.startswith("<") and t.endswith(">"))
+    if not t:
+        return True
+    if t.startswith("<") and t.endswith(">") and "://" not in t:
+        return True
+    if t.startswith("_(") and t.endswith(")_"):
+        return True
+    return False
 
 
 def update_handoff(
@@ -1550,6 +1625,8 @@ def update_handoff(
     path = Path(memory_dir) / "handoff.md"
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
     sec = split_md_sections(existing)
+    focus = "" if _is_placeholder(focus) else focus
+    next_action = "" if _is_placeholder(next_action) else next_action
     sec["Current Focus"] = focus or sec.get("Current Focus", "")
     sec["Next Action"] = next_action or sec.get("Next Action", "")
 
@@ -1566,6 +1643,11 @@ def update_handoff(
         content = sec.get(heading, "")
         out.append("" if _is_placeholder(content) else content)
         out.append("")
+    # Preserve any user-added sections that aren't part of the managed layout
+    # rather than silently dropping them on every capture.
+    for heading, content in sec.items():
+        if heading not in HANDOFF_SECTIONS and not _is_placeholder(content):
+            out += [f"## {heading}", content, ""]
     path.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
 
 
@@ -1573,6 +1655,8 @@ def update_current(memory_dir: Path, focus: str, recently: str) -> None:
     path = Path(memory_dir) / "current.md"
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
     sec = split_md_sections(existing)
+    focus = "" if _is_placeholder(focus) else focus
+    recently = "" if _is_placeholder(recently) else recently
     vals = {
         "Current Focus": focus or sec.get("Current Focus", ""),
         "Recently Changed": recently or sec.get("Recently Changed", ""),
@@ -1589,6 +1673,10 @@ def update_current(memory_dir: Path, focus: str, recently: str) -> None:
         content = vals[heading]
         out.append("" if _is_placeholder(content) else content)
         out.append("")
+    # Preserve any user-added sections that aren't part of the managed layout.
+    for heading, content in sec.items():
+        if heading not in CURRENT_SECTIONS and not _is_placeholder(content):
+            out += [f"## {heading}", content, ""]
     path.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
 
 
@@ -2113,50 +2201,57 @@ def render_packet_markdown(packet: dict) -> str:
     ]
 
     if not packet["fast"]:
+        # The omitted-count disclosure is emitted in BOTH branches: budget-trimming
+        # can empty a section entirely while still having hidden items, and the
+        # "… N more omitted" note must not vanish when the list renders as none.
         out += ["## Active Decisions"]
         if packet["active_decisions"]:
             for d in packet["active_decisions"]:
                 out.append(f"- `{d['id']}` — {d['rationale']}")
-            out += _omitted_note(packet, "active_decisions")
         else:
             out.append("_(none active)_")
+        out += _omitted_note(packet, "active_decisions")
         out.append("")
 
         out += ["## Failed Attempts To Avoid"]
         if packet["failed_attempts"]:
             for a in packet["failed_attempts"]:
                 out.append(f"- `{a['id']}` — do not retry: {a['do_not_retry']}")
-            out += _omitted_note(packet, "failed_attempts")
         else:
             out.append("_(none recorded)_")
+        out += _omitted_note(packet, "failed_attempts")
         out.append("")
 
         out += ["## Known Traps"]
         if packet["known_traps"]:
-            out += [f"- {t}" for t in packet["known_traps"]] + _omitted_note(packet, "known_traps")
+            out += [f"- {t}" for t in packet["known_traps"]]
         else:
             out.append("_(none recorded)_")
+        out += _omitted_note(packet, "known_traps")
         out.append("")
 
         out += ["## Open Questions / Blockers"]
         if packet["open_questions"]:
-            out += [f"- {q}" for q in packet["open_questions"]] + _omitted_note(packet, "open_questions")
+            out += [f"- {q}" for q in packet["open_questions"]]
         else:
             out.append("_(none open)_")
+        out += _omitted_note(packet, "open_questions")
         out.append("")
 
         out += ["## Likely Relevant Files"]
         if packet["likely_files"]:
-            out += [f"- {f}" for f in packet["likely_files"]] + _omitted_note(packet, "likely_files")
+            out += [f"- {f}" for f in packet["likely_files"]]
         else:
             out.append("_(none recorded)_")
+        out += _omitted_note(packet, "likely_files")
         out.append("")
 
         out += ["## Verification Commands"]
         if packet["verification"]:
-            out += [f"- {c}" for c in packet["verification"]] + _omitted_note(packet, "verification")
+            out += [f"- {c}" for c in packet["verification"]]
         else:
             out.append("_(none recorded)_")
+        out += _omitted_note(packet, "verification")
         out.append("")
 
     out += ["## Stale / Risk Warnings"]
@@ -2309,7 +2404,11 @@ def _norm_files(paths) -> set[str]:
         if not p:
             continue
         out.add(p)
-        out.add(p.rsplit("/", 1)[-1])
+        base = p.rsplit("/", 1)[-1]
+        if base:
+            # A trailing-slash directory path ("src/auth/") has an empty
+            # basename; adding "" would make every directory path overlap.
+            out.add(base)
     return out
 
 
@@ -2461,16 +2560,18 @@ def _score_item(
     min_keyword: int,
 ) -> dict | None:
     """Score one item against the query. None if it does not clear the candidate gate."""
-    # Collapse the basename/full-path variants of each physical file to one entry
-    # (prefer the variant carrying a path separator) so one file scores once.
+    # _norm_files stores each file as both its full path and its bare basename,
+    # so the intersection can hold both variants of one physical file. Count each
+    # distinct full path once, plus any bare-basename match not already covered by
+    # a matched full path. Keying on basename alone (the old approach) wrongly
+    # collapsed genuinely-distinct files that share a name (src/a/x.ts, src/b/x.ts)
+    # — undercounting the score and picking a hash-order-dependent survivor.
     raw_files = item["files"] & q_files
-    by_base: dict[str, str] = {}
-    for f in raw_files:
-        base = f.rsplit("/", 1)[-1]
-        if base not in by_base or ("/" in f and "/" not in by_base[base]):
-            by_base[base] = f
-    matched_files = sorted(by_base.values())
-    file_count = len(by_base)
+    full_paths = {f for f in raw_files if "/" in f}
+    covered = {f.rsplit("/", 1)[-1] for f in full_paths}
+    extra_bare = {f for f in raw_files if "/" not in f and f not in covered}
+    matched_files = sorted(full_paths | extra_bare)
+    file_count = len(full_paths) + len(extra_bare)
     matched_tags = item["tags"] & q_specific
     kw_overlap = item["specific"] & q_specific
     kw_count = len(kw_overlap)
@@ -2742,8 +2843,11 @@ def guard(
 
     active, history = [], []
     for m in matches:
-        live = m["status"] == "active" and not (
-            m["kind"] == "question" and m["status"] != "open"
+        # A record is live when active; an open question is live too — it must be
+        # able to drive the verdict (open-blocker floor). Resolved questions and
+        # superseded/rejected/stale records fall through to history (mention-only).
+        live = m["status"] == "active" or (
+            m["kind"] == "question" and m["status"] == "open"
         )
         (active if live else history).append(m)
 
@@ -2910,9 +3014,14 @@ _SECRET_SKIP_DIRS = {"private", "index", "generated"}
 SECRET_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
     ("aws-access-key-id", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     ("github-token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b")),
+    ("github-fine-grained-pat", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,}\b")),
     ("slack-token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
     ("google-api-key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b")),
-    ("openai-style-key", re.compile(r"\bsk-[A-Za-z0-9]{20,}\b")),
+    # sk-… covers both the legacy `sk-<base62>` and modern `sk-proj-<base62>`
+    # OpenAI shapes (the hyphen in `proj-` broke the old alnum-only pattern).
+    ("openai-style-key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b")),
+    # Stripe-style secret/restricted/publishable keys: sk_live_…, rk_test_…, etc.
+    ("stripe-style-key", re.compile(r"\b[srp]k_(?:live|test)_[A-Za-z0-9]{16,}\b")),
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b")),
     ("pem-private-key", re.compile(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----")),
     ("bearer-token", re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{20,}")),
@@ -3386,15 +3495,45 @@ def get_version() -> str:
         return _FALLBACK_VERSION
 
 
+# Global flags live on a shared parent parser inherited by every subparser, so
+# they can be passed either before or after the subcommand. The catch: argparse's
+# subparser action (_SubParsersAction.__call__) parses the subcommand into a
+# *fresh* namespace and copies its keys back over the parent namespace — which
+# clobbers any global a user set before the subcommand (issue #3). Two-part fix:
+#   1. The shared globals default to SUPPRESS, so an absent flag never lands in
+#      the sub-namespace and therefore never overwrites the parent's value.
+#   2. The top-level parser backfills the real defaults once, after parsing.
+# Subparsers stay plain argparse.ArgumentParser (see add_subparsers below) so the
+# backfill happens exactly once, at the top — never inside a sub-namespace that
+# would then be copied back.
+_GLOBAL_FLAG_DEFAULTS = {"project": None, "json": False, "plain": False, "verbose": False}
+
+
+class _BreadcrumbsParser(argparse.ArgumentParser):
+    """Top-level parser that keeps global flags working in any position."""
+
+    def parse_known_args(self, args=None, namespace=None):
+        ns, argv = super().parse_known_args(args, namespace)
+        for dest, default in _GLOBAL_FLAG_DEFAULTS.items():
+            if not hasattr(ns, dest):
+                setattr(ns, dest, default)
+        return ns, argv
+
+
 def build_parser() -> argparse.ArgumentParser:
     # Parent parser holds the global flags so every subcommand inherits them.
+    # default=SUPPRESS is load-bearing — see _BreadcrumbsParser above.
     global_parser = argparse.ArgumentParser(add_help=False)
-    global_parser.add_argument("--json", action="store_true", help="machine-readable JSON output")
-    global_parser.add_argument("--plain", action="store_true", help="plain-text output (no decoration)")
-    global_parser.add_argument("--verbose", action="store_true", help="verbose output")
-    global_parser.add_argument("--project", metavar="PATH", help="project root (default: cwd)")
+    global_parser.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                               help="machine-readable JSON output")
+    global_parser.add_argument("--plain", action="store_true", default=argparse.SUPPRESS,
+                               help="plain-text output (no decoration)")
+    global_parser.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS,
+                               help="verbose output")
+    global_parser.add_argument("--project", metavar="PATH", default=argparse.SUPPRESS,
+                               help="project root (default: cwd)")
 
-    parser = argparse.ArgumentParser(
+    parser = _BreadcrumbsParser(
         prog="crumb",
         description="Breadcrumbs — a repo-local ledger of durable project state you and your agents can follow back.",
         parents=[global_parser],
@@ -3408,7 +3547,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         help="show version and record schema_version, then exit",
     )
-    sub = parser.add_subparsers(dest="command", metavar="<command>")
+    # Subparsers are plain ArgumentParsers (not _BreadcrumbsParser) so the global
+    # backfill runs only once, at the top level — never in a copied-back sub-namespace.
+    sub = parser.add_subparsers(dest="command", metavar="<command>",
+                                parser_class=argparse.ArgumentParser)
 
     # init
     p_init = sub.add_parser(
@@ -3603,7 +3745,14 @@ def main(argv: list[str] | None = None) -> int:
     if not getattr(args, "command", None):
         parser.print_help()
         return 0
-    return args.func(args)
+    try:
+        return args.func(args)
+    except (OSError, ValueError) as exc:
+        # Expected, user-facing failures (missing template/package, permissions,
+        # unrepresentable values) surface as a clean error + nonzero exit rather
+        # than a raw traceback. Programming errors still propagate.
+        _emit_error(args, str(exc))
+        return 1
 
 
 if __name__ == "__main__":
