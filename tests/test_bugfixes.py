@@ -138,5 +138,64 @@ class SecretScanAndPrivacyTests(unittest.TestCase):
             self.assertTrue(privacy_fails, "typo'd privacy value should fail validate")
 
 
+# --------------------------------------------------------------------------- #
+# Group 4 — guard / search correctness
+# --------------------------------------------------------------------------- #
+class GuardSearchTests(unittest.TestCase):
+    def test_M9_norm_files_drops_empty_basename_for_trailing_slash(self):
+        out = crumb._norm_files(["src/auth/"])
+        self.assertNotIn("", out)
+
+    def test_M9_unrelated_dirs_do_not_match_via_empty_basename(self):
+        a = crumb._norm_files(["build/"])
+        b = crumb._norm_files(["logs/"])
+        self.assertEqual(a & b, set())  # no spurious "" overlap
+
+    def _file_item(self, files):
+        return {
+            "id": "x", "kind": "decision", "status": "active", "title": "t",
+            "tags": set(), "specific": set(), "branch": None, "record": None,
+            "do_not_retry": False, "files": crumb._norm_files(files),
+        }
+
+    def test_M10_distinct_files_same_basename_count_separately(self):
+        item = self._file_item(["src/a/config.ts", "src/b/config.ts"])
+        q_files = crumb._norm_files(["src/a/config.ts", "src/b/config.ts"])
+        res = crumb._score_item(item, set(), q_files, Path("."), "main", 9999, min_keyword=2)
+        self.assertIsNotNone(res)
+        # both distinct files must be cited and scored, not collapsed to one
+        self.assertEqual(len(res["matched_files"]), 2)
+        self.assertEqual(res["score"], crumb.GUARD_W_FILE * 2 + crumb.GUARD_W_STATUS_ACTIVE)
+
+    def test_M10_basename_variant_of_same_file_not_double_counted(self):
+        item = self._file_item(["src/a/config.ts"])
+        q_files = crumb._norm_files(["src/a/config.ts"])
+        res = crumb._score_item(item, set(), q_files, Path("."), "main", 9999, min_keyword=2)
+        self.assertEqual(len(res["matched_files"]), 1)
+
+    def test_H5_open_question_drives_guard_verdict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            crumb.main(["init", "--project", str(root), "--session-tracking", "full"])
+            mem = root / crumb.MEMORY_DIRNAME
+            (mem / "open-questions.md").write_text(
+                "# Open Questions\n\n"
+                "## Q: Should the payments reconciliation ledger be rewritten?\n"
+                "- opened: 2026-06-25\n"
+                "- status: open\n\n"
+                "Touches src/payments/ledger.py — unresolved.\n",
+                encoding="utf-8",
+            )
+            result = crumb.guard(
+                mem, root,
+                "rewrite the payments reconciliation ledger",
+                files=["src/payments/ledger.py"],
+            )
+            ids = [m["id"] for m in result["matches"]]
+            self.assertTrue(any(i.startswith("q:") for i in ids),
+                            f"open question should reach verdict matches; got {ids}")
+            self.assertNotEqual(result["verdict"], "PROCEED")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -2354,7 +2354,11 @@ def _norm_files(paths) -> set[str]:
         if not p:
             continue
         out.add(p)
-        out.add(p.rsplit("/", 1)[-1])
+        base = p.rsplit("/", 1)[-1]
+        if base:
+            # A trailing-slash directory path ("src/auth/") has an empty
+            # basename; adding "" would make every directory path overlap.
+            out.add(base)
     return out
 
 
@@ -2506,16 +2510,18 @@ def _score_item(
     min_keyword: int,
 ) -> dict | None:
     """Score one item against the query. None if it does not clear the candidate gate."""
-    # Collapse the basename/full-path variants of each physical file to one entry
-    # (prefer the variant carrying a path separator) so one file scores once.
+    # _norm_files stores each file as both its full path and its bare basename,
+    # so the intersection can hold both variants of one physical file. Count each
+    # distinct full path once, plus any bare-basename match not already covered by
+    # a matched full path. Keying on basename alone (the old approach) wrongly
+    # collapsed genuinely-distinct files that share a name (src/a/x.ts, src/b/x.ts)
+    # — undercounting the score and picking a hash-order-dependent survivor.
     raw_files = item["files"] & q_files
-    by_base: dict[str, str] = {}
-    for f in raw_files:
-        base = f.rsplit("/", 1)[-1]
-        if base not in by_base or ("/" in f and "/" not in by_base[base]):
-            by_base[base] = f
-    matched_files = sorted(by_base.values())
-    file_count = len(by_base)
+    full_paths = {f for f in raw_files if "/" in f}
+    covered = {f.rsplit("/", 1)[-1] for f in full_paths}
+    extra_bare = {f for f in raw_files if "/" not in f and f not in covered}
+    matched_files = sorted(full_paths | extra_bare)
+    file_count = len(full_paths) + len(extra_bare)
     matched_tags = item["tags"] & q_specific
     kw_overlap = item["specific"] & q_specific
     kw_count = len(kw_overlap)
@@ -2787,8 +2793,11 @@ def guard(
 
     active, history = [], []
     for m in matches:
-        live = m["status"] == "active" and not (
-            m["kind"] == "question" and m["status"] != "open"
+        # A record is live when active; an open question is live too — it must be
+        # able to drive the verdict (open-blocker floor). Resolved questions and
+        # superseded/rejected/stale records fall through to history (mention-only).
+        live = m["status"] == "active" or (
+            m["kind"] == "question" and m["status"] == "open"
         )
         (active if live else history).append(m)
 
