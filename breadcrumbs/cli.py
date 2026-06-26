@@ -368,8 +368,13 @@ def _parse_scalar(val: str):
     val = val.strip()
     if val == "":
         return None
-    if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
-        return val[1:-1]
+    if val[0] in "\"'":
+        # Quoted scalar: return the content up to the matching closing quote and
+        # ignore anything after it (e.g. a trailing ` # comment`). A `#` *inside*
+        # the quotes is preserved. An unterminated quote falls through to literal.
+        end = val.find(val[0], 1)
+        if end != -1:
+            return val[1:end]
     val = _strip_inline_comment(val)
     if val in ("null", "~"):
         return None
@@ -462,6 +467,10 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
     A document with no leading `---` fence has empty frontmatter and is returned
     verbatim as the body. An opened-but-unterminated fence is malformed.
     """
+    if text.startswith("﻿"):
+        # A UTF-8 BOM survives str.strip(), so it would mask the opening fence
+        # and silently drop the whole frontmatter. Strip a single leading BOM.
+        text = text[1:]
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
         return {}, text
@@ -521,8 +530,16 @@ class Record:
 
     @classmethod
     def from_file(cls, path: Path, rtype: str) -> "Record":
+        # utf-8-sig transparently consumes a BOM. A decode failure or any OS
+        # error (binary file, directory, broken symlink, permissions) is captured
+        # as a Record error — never raised — so a single bad file can't crash the
+        # walk that load_records()/validate run over the whole store.
         try:
-            meta, body = parse_frontmatter(Path(path).read_text(encoding="utf-8"))
+            text = Path(path).read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError) as exc:
+            return cls(path, rtype, meta=None, body="", error=f"unreadable file: {exc}")
+        try:
+            meta, body = parse_frontmatter(text)
         except FrontmatterError as exc:
             return cls(path, rtype, meta=None, body="", error=str(exc))
         return cls(path, rtype, meta=meta, body=body)
