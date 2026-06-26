@@ -638,6 +638,9 @@ def git_dirty_files(root: Path) -> list[str]:
     for line in out.splitlines():
         # porcelain: 2 status chars + space + path
         path = line[3:].strip() if len(line) > 3 else line.strip()
+        if " -> " in path:
+            # rename/copy entries are "R  old -> new"; record the destination.
+            path = path.split(" -> ", 1)[1].strip()
         if path:
             files.append(path)
     return files
@@ -1584,9 +1587,21 @@ def split_md_sections(text: str) -> dict[str, str]:
 
 
 def _is_placeholder(text: str) -> bool:
-    """True for empty content or the angle-bracket template stubs."""
+    """True for empty content, the `<...>` template stubs, or `_(...)_` notes.
+
+    A `<...>` autolink URL (contains `://`) is real content, not a stub. The
+    `_(...)_` italic form is what the capture prefill emits when there is nothing
+    to report (e.g. `_(no new commits)_`) — treating it as a placeholder keeps it
+    from clobbering a previously meaningful section.
+    """
     t = text.strip()
-    return (not t) or (t.startswith("<") and t.endswith(">"))
+    if not t:
+        return True
+    if t.startswith("<") and t.endswith(">") and "://" not in t:
+        return True
+    if t.startswith("_(") and t.endswith(")_"):
+        return True
+    return False
 
 
 def update_handoff(
@@ -1595,6 +1610,8 @@ def update_handoff(
     path = Path(memory_dir) / "handoff.md"
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
     sec = split_md_sections(existing)
+    focus = "" if _is_placeholder(focus) else focus
+    next_action = "" if _is_placeholder(next_action) else next_action
     sec["Current Focus"] = focus or sec.get("Current Focus", "")
     sec["Next Action"] = next_action or sec.get("Next Action", "")
 
@@ -1611,6 +1628,11 @@ def update_handoff(
         content = sec.get(heading, "")
         out.append("" if _is_placeholder(content) else content)
         out.append("")
+    # Preserve any user-added sections that aren't part of the managed layout
+    # rather than silently dropping them on every capture.
+    for heading, content in sec.items():
+        if heading not in HANDOFF_SECTIONS and not _is_placeholder(content):
+            out += [f"## {heading}", content, ""]
     path.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
 
 
@@ -1618,6 +1640,8 @@ def update_current(memory_dir: Path, focus: str, recently: str) -> None:
     path = Path(memory_dir) / "current.md"
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
     sec = split_md_sections(existing)
+    focus = "" if _is_placeholder(focus) else focus
+    recently = "" if _is_placeholder(recently) else recently
     vals = {
         "Current Focus": focus or sec.get("Current Focus", ""),
         "Recently Changed": recently or sec.get("Recently Changed", ""),
@@ -1634,6 +1658,10 @@ def update_current(memory_dir: Path, focus: str, recently: str) -> None:
         content = vals[heading]
         out.append("" if _is_placeholder(content) else content)
         out.append("")
+    # Preserve any user-added sections that aren't part of the managed layout.
+    for heading, content in sec.items():
+        if heading not in CURRENT_SECTIONS and not _is_placeholder(content):
+            out += [f"## {heading}", content, ""]
     path.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
 
 

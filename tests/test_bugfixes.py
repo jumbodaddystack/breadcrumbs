@@ -197,5 +197,62 @@ class GuardSearchTests(unittest.TestCase):
             self.assertNotEqual(result["verdict"], "PROCEED")
 
 
+# --------------------------------------------------------------------------- #
+# Group 5 — capture / handoff fidelity
+# --------------------------------------------------------------------------- #
+import subprocess  # noqa: E402
+
+
+class CaptureHandoffTests(unittest.TestCase):
+    def _git(self, root, *args):
+        subprocess.run(["git", *args], cwd=root, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def test_M3_renamed_file_records_destination_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._git(root, "init")
+            self._git(root, "config", "user.email", "t@t")
+            self._git(root, "config", "user.name", "t")
+            (root / "old.txt").write_text("hello\n")
+            self._git(root, "add", "-A")
+            self._git(root, "commit", "-m", "init")
+            self._git(root, "mv", "old.txt", "new.txt")
+            dirty = crumb.git_dirty_files(root)
+            self.assertIn("new.txt", dirty)
+            self.assertNotIn("old.txt -> new.txt", dirty)
+
+    def test_M4_handoff_preserves_user_added_section(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mem = Path(tmp)
+            (mem / "handoff.md").write_text(
+                "# Project Handoff\n\n## Current Focus\nold focus\n\n"
+                "## My Custom Section\nvaluable user notes\n",
+                encoding="utf-8",
+            )
+            crumb.update_handoff(mem, "main", "abc1234", "new focus", "do x")
+            text = (mem / "handoff.md").read_text(encoding="utf-8")
+            self.assertIn("My Custom Section", text)
+            self.assertIn("valuable user notes", text)
+
+    def test_M5_no_commits_does_not_clobber_recently_changed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mem = Path(tmp)
+            (mem / "current.md").write_text(
+                "# Current State\n\n## Current Focus\nf\n\n"
+                "## Recently Changed\n- real prior summary\n\n## Watch Out For\nw\n",
+                encoding="utf-8",
+            )
+            crumb.update_current(mem, "f2", "_(no new commits)_")
+            text = (mem / "current.md").read_text(encoding="utf-8")
+            self.assertIn("real prior summary", text)
+            self.assertNotIn("_(no new commits)_", text)
+
+    def test_M5b_autolink_is_not_treated_as_placeholder(self):
+        self.assertFalse(crumb._is_placeholder("<https://wiki/internal>"))
+        # genuine angle-bracket template stub still detected
+        self.assertTrue(crumb._is_placeholder("<describe the current focus>"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
