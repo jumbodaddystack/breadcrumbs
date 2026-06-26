@@ -98,5 +98,45 @@ class WritePathRoundTripTests(unittest.TestCase):
             self.assertEqual(decisions, [])  # nothing corrupted/written
 
 
+# --------------------------------------------------------------------------- #
+# Group 3 — secret scan + privacy vocabulary
+# --------------------------------------------------------------------------- #
+def _matches_any_secret(sample: str) -> bool:
+    return any(pat.search(sample) for _, pat in crumb.SECRET_PATTERNS)
+
+
+class SecretScanAndPrivacyTests(unittest.TestCase):
+    def test_M7_openai_project_key(self):
+        self.assertTrue(_matches_any_secret("OPENAI_KEY=sk-proj-" + "A1b2" * 10))
+
+    def test_M7_github_fine_grained_pat(self):
+        self.assertTrue(_matches_any_secret("creds: github_pat_" + "A1b2c3D4e5" * 3))
+
+    def test_M7_stripe_secret_key(self):
+        self.assertTrue(_matches_any_secret("STRIPE=sk_live_" + "A1b2c3D4e5f6g7h8"))
+
+    def test_M6_privacy_typo_is_flagged_by_validate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            crumb.main(["init", "--project", str(root), "--session-tracking", "full"])
+            mem = root / crumb.MEMORY_DIRNAME
+            (mem / "decisions" / "2026-06-25-typo.md").write_text(
+                "---\n"
+                "id: dec_20260625_typo\n"
+                "type: decision\n"
+                "slug: typo\n"
+                "status: active\n"
+                "created_at: 2026-06-25T10:00:00-05:00\n"
+                "confidence: low\n"
+                "privacy: secret-prohibitted\n"  # typo — must NOT silently pass
+                "---\n## Context\nx\n## Decision\ny\n",
+                encoding="utf-8",
+            )
+            findings = crumb.run_validate(mem)
+            privacy_fails = [f for f in findings
+                             if f["check"] == "privacy" and f["status"] == "fail"]
+            self.assertTrue(privacy_fails, "typo'd privacy value should fail validate")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
