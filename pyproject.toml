@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "breadcrumbs"
+version = "0.1.0"
+description = "Breadcrumbs — leave a trail your future self and your agents can follow back: a portable, repo-local, human-readable ledger of durable project state for human–agent software work."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+keywords = ["agent", "memory", "continuity", "cli", "project-memory", "handoff"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development",
+    "Topic :: Utilities",
+]
+# Standard library only — there are no runtime dependencies, by design
+# (plan §1 / non-goal 4: plain files + CLI work first, no third-party deps).
+dependencies = []
+
+# The MCP server (Phase 8) is the one optional interop layer. It is NOT a core
+# dependency: the CLI and plain files work without it (graceful degradation,
+# plan §3 / §13 "MCP later"). Install it explicitly with `pip install
+# "breadcrumbs[mcp]"`. The SDK needs Python >=3.10, hence the marker.
+[project.optional-dependencies]
+mcp = ["mcp>=1.2; python_version >= '3.10'"]
+
+# Versioning note: this is the package version (semantic). It is independent of
+# the *record* schema_version, which the manifest carries as `schema_version: 1`
+# and `crumb --version` prints alongside the package version. A bump to the
+# record schema is a separate, breaking change tracked by SCHEMA_VERSION in
+# breadcrumbs/cli.py; the package MAJOR version moves with it.
+
+[project.scripts]
+crumb = "breadcrumbs.cli:main"
+# Optional MCP server entry point. The script is always installed, but it only
+# runs when the [mcp] extra is present; otherwise it prints install guidance and
+# exits non-zero (it never imports the SDK at module load).
+breadcrumbs-mcp = "breadcrumbs.mcp_server:main"
+
+[project.urls]
+Homepage = "https://github.com/jumbodaddystack/breadcrumbs"
+Documentation = "https://github.com/jumbodaddystack/breadcrumbs/tree/main/docs"
+
+[tool.setuptools.packages.find]
+include = ["breadcrumbs*"]
+
+# Ship the .project-memory template tree as package data so `init` finds
+# templates wherever the package is installed (never a repo-relative path).
+# Explicit depth-1/depth-2 globs (not `**`) for setuptools-version robustness;
+# .gitkeep files are bundled so `init` recreates the empty record directories.
+[tool.setuptools.package-data]
+breadcrumbs = [
+    "templates/project-memory/*.md",
+    "templates/project-memory/*.yml",
+    "templates/project-memory/*/*.md",
+    "templates/project-memory/*/*.yml",
+    "templates/project-memory/*/.gitkeep",
+]

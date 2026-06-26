@@ -1,0 +1,300 @@
+# Record Schema
+
+The concrete data contract for `.project-memory/`: directory layout, git-tracking
+policy, the manifest, canonical frontmatter, record identity, field population, the
+status/privacy vocabularies, and the body templates.
+
+---
+
+## 1. Installed directory layout
+
+`crumb init` creates this tree in a target project:
+
+```text
+.project-memory/
+  README.md
+  manifest.yml
+
+  current.md
+  handoff.md
+  open-questions.md
+  known-traps.md
+
+  decisions/      .gitkeep
+  attempts/       .gitkeep
+  sessions/       .gitkeep
+  ideas/          .gitkeep
+
+  evidence/
+    refs.yml
+
+  generated/
+    README.md
+    resume-packet.md
+    stale-report.md
+    memory-index.md
+
+  private/
+    README.md
+
+  index/
+    README.md
+```
+
+---
+
+## 2. Git-tracking policy
+
+**Committed by default:**
+
+```text
+.project-memory/README.md
+.project-memory/manifest.yml
+.project-memory/current.md
+.project-memory/handoff.md
+.project-memory/open-questions.md
+.project-memory/known-traps.md
+.project-memory/decisions/
+.project-memory/attempts/
+.project-memory/sessions/
+.project-memory/ideas/
+.project-memory/evidence/refs.yml
+.project-memory/generated/README.md
+.project-memory/index/README.md
+```
+
+**Always gitignored:**
+
+```gitignore
+.project-memory/private/**
+.project-memory/index/**
+!.project-memory/index/README.md
+.project-memory/generated/*.local.md
+.project-memory/generated/*.tmp
+```
+
+### Two policies chosen at `init`
+
+Recorded in `manifest.yml` so every later command stays consistent:
+
+1. **`commit_generated_projections`** (default `true`). When `true`, the generated
+   Markdown projections (`generated/resume-packet.md`, `stale-report.md`,
+   `memory-index.md`) are committed — this serves the "cloud agent with no CLI"
+   user story (a read-only agent gets a pre-built catch-up file). Each projection
+   carries a source commit/hash header so staleness is visible. Flip to `false`
+   (`init --no-commit-generated`) to keep a clean history; `init` then adds
+   `.project-memory/generated/*.md` to `.gitignore` while keeping the README.
+   **SQLite and vector indexes (`index/**`) are always ignored regardless.**
+
+2. **`session_tracking`** (`full` | `distillate`):
+   - `full` — commit dated session records, so handoffs and history travel across
+     people and devices.
+   - `distillate` — `sessions/` stays local (gitignored); only promoted
+     `decisions/` and `attempts/` are committed, keeping the shared repo lean.
+
+   `init` prompts for this (or accepts `--session-tracking <full|distillate>`,
+   defaulting to `full` non-interactively) and writes the matching `.gitignore`
+   rules. Solo multi-device work favors `full`; large team repos often favor
+   `distillate`.
+
+`init` writes the managed `.gitignore` block; `audit`/`validate` read the manifest
+rather than guessing.
+
+---
+
+## 3. Manifest (`manifest.yml`)
+
+The per-project control file. Carries the schema version (so `validate` can check
+forward-compat) and the tracking policies chosen at `init`:
+
+```yaml
+schema_version: 1
+created_at: 2026-06-25T14:30:00-05:00
+project: <project-name>
+# Tracking policy chosen during `crumb init`:
+session_tracking: full        # full | distillate
+commit_generated_projections: true   # commit generated/*.md (indexes always ignored)
+```
+
+`schema_version` is `1` for this build. `project` is auto-derived from the project
+root directory name. `created_at` is ISO-8601 with timezone.
+
+---
+
+## 4. Canonical frontmatter
+
+Every durable record is Markdown with YAML frontmatter. Values in `<angle
+brackets>` are placeholders an implementation fills — never literals to copy (e.g.
+do not emit `abc1234` as a default commit).
+
+```yaml
+id: dec_20260625_repo-local-memory-source-of-truth   # computed: <type-prefix>_<YYYYMMDD>_<slug>
+type: decision
+slug: repo-local-memory-source-of-truth              # the human segment of the filename
+title: Use repo-local Markdown as source of truth
+status: active              # active | superseded | stale | disputed | rejected | quarantined
+created_at: 2026-06-25T14:30:00-05:00
+updated_at: 2026-06-25T14:30:00-05:00
+created_by: <username>      # human username or agent label, auto-derived
+agent: human               # human | claude-code | codex | cursor | gemini | opencode | other
+project: <project-name>    # auto-derived from repo/dir name
+scope: project             # project | feature | branch | local | private
+branch: <current-branch>   # auto-derived from git HEAD
+commit: <short-sha>        # auto-derived from git HEAD
+dirty_files: []            # auto-derived from git status
+confidence: medium         # low | medium | high   (default: medium)
+privacy: repo-safe         # repo-safe | local-private | secret-prohibited  (default: repo-safe)
+review_status: unreviewed  # unreviewed | reviewed | needs-review  (default: unreviewed)
+reviewed_by: null
+supersedes: []
+superseded_by: null
+expires_at: null
+tags:
+  - memory
+  - architecture
+evidence:
+  - type: commit
+    ref: <short-sha>
+  - type: command
+    ref: npm test
+```
+
+---
+
+## 5. Record identity (filename-canonical)
+
+Identity is **filename-canonical**. The file's path is the single source of truth;
+`id` and `slug` are computed from it and never stored as an independent authority.
+
+- Filename pattern for directory records: `<YYYY-MM-DD>-<slug>.md`
+  (e.g. `decisions/2026-06-25-repo-local-memory-source-of-truth.md`).
+- `slug` = the human segment of the filename (everything after the date).
+- `id` = `<type-prefix>_<YYYYMMDD>_<slug>`, with type-prefixes:
+  `dec` (decision), `att` (attempt), `idea`, `ses` (session), `trap`, `q`
+  (question).
+
+Why filename-canonical: the filesystem cannot hold two files with the same name in
+one directory, so ID uniqueness is enforced for free and id/slug/filename cannot
+drift. `validate` (Phase 2) recomputes `id`/`slug` from the filename and flags any
+frontmatter that disagrees rather than trusting the stored value.
+
+---
+
+## 6. Field population — keeping capture under 90 seconds
+
+Most fields are machine-filled so a human is asked for almost nothing.
+
+| Population | Fields | Source |
+|---|---|---|
+| **Auto-derived** | `id`, `slug`, `created_at`, `updated_at`, `created_by`, `agent`, `project`, `branch`, `commit`, `dirty_files` | filename, system clock, git, environment |
+| **Defaulted** (overridable) | `status: active`, `confidence: medium`, `privacy: repo-safe`, `review_status: unreviewed`, `scope: project`, `tags: []`, `supersedes/superseded_by/expires_at: null` | constants |
+| **Prompted** | `title`, the record body sections, optionally `tags` and `evidence` | interactive input |
+
+A routine `remember`/`capture` requires only a title and a few body lines.
+
+---
+
+## 7. Non-git fallback (resolved Phase 1)
+
+Several frontmatter fields are git-derived (`branch`, `commit`, `dirty_files`).
+When the project is **not** a git repo, the tool uses defined sentinels everywhere:
+
+| Field | Non-git sentinel |
+|---|---|
+| `branch` | `(no-git)` |
+| `commit` | `(no-git)` |
+| `dirty_files` | `[]` (empty list) |
+
+`init` detects whether the project is a git work tree and prints a notice when it is
+not. Phases 3–6 (record writers, `resume`, `guard`, `audit`) consume these exact
+sentinels so behavior is consistent: a record showing `branch: (no-git)` is not
+flagged as a branch mismatch, and staleness logic that relies on commit-distance
+degrades gracefully (age-based signals still apply).
+
+---
+
+## 8. Status meanings
+
+| Status | Meaning |
+|---|---|
+| `active` | Current and safe to consider. |
+| `superseded` | Replaced by a newer record. Must include `superseded_by`. |
+| `stale` | Possibly outdated; must be revalidated. |
+| `disputed` | Conflicts with another record, code, tests, docs, or user instruction. |
+| `rejected` | Considered and intentionally not used. |
+| `quarantined` | Suspected unsafe/private/poisoned; do not use for agent guidance. |
+
+## 9. Privacy meanings
+
+| Privacy | Meaning |
+|---|---|
+| `repo-safe` | May be committed. |
+| `local-private` | Must live under `private/` or an external private store. |
+| `secret-prohibited` | Must not be stored in project memory at all. |
+
+---
+
+## 10. Body templates
+
+### Decision record
+
+```markdown
+## Context
+## Options Considered
+## Decision
+## Rationale
+## Consequences
+## What Not To Retry
+## Evidence
+## Stale / Review Conditions
+```
+
+### Attempt record
+
+```markdown
+## Problem
+## Tried
+## Result
+## Why It Failed / Succeeded
+## Do Not Retry Unless
+## Evidence
+## Related Records
+```
+
+### Session record
+
+```markdown
+## Starting Context
+## Work Completed
+## Decisions Made
+## Attempts / Failures
+## Open Questions
+## Files Touched
+## Commands / Verification
+## Next Action
+```
+
+The "Work Completed", "Files Touched", and "Commands / Verification" sections are
+pre-filled from git (`log`, `status`, `diff --stat` since the last session record)
+and edited by the human. A `--fast` capture writes a minimal session record (git
+snapshot + "Next Action" only) and defers the narrative sections.
+
+### Handoff file
+
+```markdown
+# Project Handoff
+
+_Last updated: <YYYY-MM-DDTHH:mm:ssZ>_
+_Branch: <branch>_
+_Commit: <short-sha>_
+
+## Current Focus
+## Next Action
+## Blockers / Open Questions
+## Active Decisions To Respect
+## Failed Attempts To Avoid
+## Known Traps
+## Likely Relevant Files
+## Verification Commands
+## Stale If
+```
