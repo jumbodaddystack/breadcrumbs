@@ -65,5 +65,38 @@ class ParserIORobustnessTests(unittest.TestCase):
         self.assertEqual(crumb._parse_scalar("active   # the default"), "active")
 
 
+# --------------------------------------------------------------------------- #
+# Group 2 — write-path round-trip integrity
+# --------------------------------------------------------------------------- #
+class WritePathRoundTripTests(unittest.TestCase):
+    def test_M2a_is_map_item_is_quote_aware(self):
+        self.assertFalse(crumb._is_map_item('"a: b"'))
+        self.assertFalse(crumb._is_map_item("'k: v'"))
+        # genuine map item still detected
+        self.assertTrue(crumb._is_map_item("type: commit"))
+
+    def test_M2a_list_scalar_with_colon_roundtrips(self):
+        meta = {"tags": ["area: backend", "todo:", "plain"]}
+        text = "---\n" + crumb.render_frontmatter(meta).split("---\n", 1)[1]
+        parsed, _ = crumb.parse_frontmatter(text + "\nbody\n")
+        self.assertEqual(parsed["tags"], ["area: backend", "todo:", "plain"])
+
+    def test_M2b_render_scalar_rejects_newline(self):
+        with self.assertRaises(ValueError):
+            crumb._render_scalar("line1\nfoo: bar")
+
+    def test_M2b_newline_title_rejected_no_record_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            crumb.main(["init", "--project", str(root), "--session-tracking", "full"])
+            rc = crumb.main([
+                "remember", "decision", "--project", str(root),
+                "--title", "Line1\nfoo: bar", "--confidence", "low",
+            ])
+            self.assertNotEqual(rc, 0)
+            decisions = list((root / crumb.MEMORY_DIRNAME / "decisions").glob("*.md"))
+            self.assertEqual(decisions, [])  # nothing corrupted/written
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

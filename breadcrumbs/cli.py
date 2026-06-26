@@ -384,7 +384,13 @@ def _parse_scalar(val: str):
 
 
 def _is_map_item(after_dash: str) -> bool:
-    """A list item is a map if it looks like `key: value` or `key:`."""
+    """A list item is a map if it looks like `key: value` or `key:`.
+
+    A quoted item is always a scalar, even if it contains `: ` — otherwise a
+    tag like `"area: backend"` would be misread as a {key: value} map.
+    """
+    if after_dash[:1] in "\"'":
+        return False
     return ": " in after_dash or after_dash.endswith(":")
 
 
@@ -1012,7 +1018,7 @@ _EMPTY_SECTION = "_(not recorded)_"
 
 # ---- rendering ------------------------------------------------------------- #
 
-def _needs_quote(s: str) -> bool:
+def _needs_quote(s: str, in_list: bool = False) -> bool:
     if s == "":
         return True
     if s in ("null", "~", "[]", "true", "false"):
@@ -1023,10 +1029,15 @@ def _needs_quote(s: str) -> bool:
         return True
     if " #" in s:
         return True
+    # In a block list, a `: ` or trailing `:` would make the parser read the
+    # item as a {key: value} map instead of a scalar (see _is_map_item), so it
+    # must be quoted. At the top level a colon in the value is harmless.
+    if in_list and (": " in s or s.endswith(":")):
+        return True
     return False
 
 
-def _render_scalar(v) -> str:
+def _render_scalar(v, in_list: bool = False) -> str:
     """Render a scalar so it round-trips through `parse_frontmatter`."""
     if v is None:
         return "null"
@@ -1035,7 +1046,12 @@ def _render_scalar(v) -> str:
     if v is False:
         return "false"
     s = str(v)
-    if _needs_quote(s):
+    if "\n" in s or "\r" in s:
+        # The frontmatter is a line-based YAML subset with no multi-line scalar
+        # support: a newline would silently truncate the value and inject the
+        # remainder as bogus keys. Reject it at the source instead of corrupting.
+        raise ValueError("frontmatter values must be single-line (no newlines)")
+    if _needs_quote(s, in_list=in_list):
         q = "'" if '"' in s else '"'
         return f"{q}{s}{q}"
     return s
@@ -1064,7 +1080,7 @@ def render_frontmatter(meta: dict) -> str:
             else:
                 lines.append(f"{key}:")
                 for item in v:
-                    lines.append(f"  - {_render_scalar(item)}")
+                    lines.append(f"  - {_render_scalar(item, in_list=True)}")
         else:
             lines.append(f"{key}: {_render_scalar(v)}")
     lines.append("---")
@@ -1336,20 +1352,25 @@ def cmd_remember(args: argparse.Namespace) -> int:
             )
             return 2
 
-    path, meta = write_record(
-        memory_dir,
-        root,
-        rtype,
-        title,
-        sections,
-        tags=tags,
-        evidence=evidence,
-        confidence=confidence,
-        privacy=args.privacy,
-        scope=args.scope,
-        status=args.status,
-        agent=args.agent,
-    )
+    try:
+        path, meta = write_record(
+            memory_dir,
+            root,
+            rtype,
+            title,
+            sections,
+            tags=tags,
+            evidence=evidence,
+            confidence=confidence,
+            privacy=args.privacy,
+            scope=args.scope,
+            status=args.status,
+            agent=args.agent,
+        )
+    except ValueError as exc:
+        # e.g. a newline in a frontmatter field — rendering refuses to corrupt.
+        _emit_error(args, str(exc))
+        return 2
 
     # Post-write validate gate (defense in depth — fail fast, don't leave a bad file).
     fails = _validate_new_file(memory_dir, path)
