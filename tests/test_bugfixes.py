@@ -323,5 +323,26 @@ class InitMainRobustnessTests(unittest.TestCase):
             self.assertEqual(precious.read_text(), "important\n")
 
 
+# --------------------------------------------------------------------------- #
+# Group 8 — MCP adapter
+# --------------------------------------------------------------------------- #
+from breadcrumbs import mcp_core  # noqa: E402
+
+
+class McpAdapterTests(unittest.TestCase):
+    def test_MCP1_attempt_uri_does_not_return_a_decision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            crumb.main(["init", "--project", str(root), "--session-tracking", "full"])
+            res = mcp_core.tool_record("decision", {"title": "D"}, root=str(root))
+            self.assertTrue(res["ok"], res)
+            did = res["id"]
+            # the decision URI resolves it
+            self.assertIn(did, mcp_core.resource_decision(did, root=str(root)))
+            # the attempts URI must NOT serve a decision record by id
+            with self.assertRaises(KeyError):
+                mcp_core.resource_attempt(did, root=str(root))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
