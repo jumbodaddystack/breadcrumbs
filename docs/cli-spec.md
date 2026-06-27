@@ -32,20 +32,38 @@ Default output is human-readable Markdown / plain text.
 | `validate` | all canonical files | validation output | Enforce schema and invariants (deterministic). | 2 |
 | `remember decision` | git state, user input | decision record | Capture a durable choice. | 3 |
 | `remember attempt` | git state, user input | attempt record | Capture a tried path and its outcome. | 3 |
-| `capture session` | git state (log, status, diff --stat) | session record, handoff, current | Record session end; git-prefill body sections. `--fast` = git-only snapshot + one-line next action. | 3 |
+| `capture session` | git state (log, status, diff --shortstat) | session record, handoff, current | Record session end; git-prefill body sections (Files Touched is a counts-only summary). `--fast` = git-only snapshot + one-line next action. | 3 |
+| `schema [<type>]` | (none) | record contract | Print body sections / vocab / rules from source constants. `--template <type>` emits a `remember` skeleton. | **built** |
+| `note question\|trap\|idea` | user input, git state | open-questions / known-traps / idea record | Write-surface for the three kinds with no `remember` type; refreshes the resume packet. | **built** |
 | `resume` | current, handoff, records, git state | generated resume packet | Print a bounded resume packet (≤5k tokens) with computed staleness. `--fast` = git snapshot + focus + next action + staleness (print-only). | **4 (built)** |
 | `guard "<action>"` | decisions, attempts, traps, questions, handoff | optional session note | Warn before a repeated mistake (deterministic ranking). | 5 |
 | `audit` | all memory + adapters | health report | Find stale / unsafe / bloated memory (incl. secret + instruction-like heuristics). Heuristic — does NOT gate `validate`. | **6 (built)** |
 | `scan-secrets` | committed memory | secret report | Scan committed memory for secret-like strings; non-zero on a hit. Run before committing memory. | **6 (built)** |
+| `doctor` | adapters, `.mcp.json`, hooks, packet | integration-health report | Is memory wired up? Exit 1 if a store exists but no integration is active. | **built** |
+| `mcp serve\|register` | `.mcp.json` | running server / registration | Run the MCP server, or merge its `.mcp.json` entry. | **built** |
+| `hook session\|guard\|capture` | hook stdin payload | hook JSON on stdout | Claude Code hook translators (`init --with-hooks` installs them). | **built** |
+
+### Integration flags on `init`
+
+```text
+init --with-adapter[=CLAUDE.md,…] / --no-adapter   # signpost block in detected guidance files
+init --with-mcp / --no-mcp                          # merge .mcp.json entry
+init --with-hooks[=session,guard,capture] / --no-hooks
+init --print-integrations                           # dry run
+init --remove-integrations                          # reverse everything
+```
+
+On a TTY with none specified, `init` asks once per integration; non-interactive +
+unspecified writes nothing (plus a one-line nudge). Every edit is fenced and
+reversible.
 
 ### Later commands (post-MVP)
 
 ```text
-remember idea | remember question
 mark-status <id> <status>
 supersede <old-id> <new-id>
 build-index
-dashboard | register | recent | where-was-i
+dashboard | recent | where-was-i
 ```
 
 ---

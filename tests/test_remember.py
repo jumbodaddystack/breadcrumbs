@@ -111,6 +111,48 @@ class RememberAttemptTests(unittest.TestCase):
             self.assertEqual(len(list((mem / "attempts").glob("*.md"))), 1)
             self.assertEqual([f for f in crumb.run_validate(mem) if f["status"] == "fail"], [])
 
+    def test_named_attempt_flags_fill_sections(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mem = init_store(tmp)
+            code, _ = run(
+                [
+                    "remember", "attempt", "--project", tmp,
+                    "--title", "gradle daemon stop breaks build",
+                    "--problem", "build hung",
+                    "--tried", "./gradlew --stop",
+                    "--result", "R.jar lock error",
+                    "--why", "daemon held a lock",
+                    "--do-not-retry", "unless lockfile cleared",
+                    "--evidence", "commit", "abc1234",
+                ]
+            )
+            self.assertEqual(code, 0)
+            path = next((mem / "attempts").glob("*.md"))
+            _, body = crumb.parse_frontmatter(path.read_text())
+            rec = crumb.Record(path, "attempt", {}, body)
+            self.assertEqual(rec.sections["Problem"], "build hung")
+            self.assertEqual(rec.sections["Tried"], "./gradlew --stop")
+            self.assertEqual(rec.sections["Why It Failed / Succeeded"], "daemon held a lock")
+            self.assertEqual(rec.sections["Do Not Retry Unless"], "unless lockfile cleared")
+            self.assertEqual([f for f in crumb.run_validate(mem) if f["status"] == "fail"], [])
+
+    def test_named_flag_overrides_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mem = init_store(tmp)
+            run(
+                [
+                    "remember", "attempt", "--project", tmp,
+                    "--title", "override check",
+                    "--set", "Problem", "from set",
+                    "--problem", "from flag",
+                    "--confidence", "low",
+                ]
+            )
+            path = next((mem / "attempts").glob("*.md"))
+            _, body = crumb.parse_frontmatter(path.read_text())
+            rec = crumb.Record(path, "attempt", {}, body)
+            self.assertEqual(rec.sections["Problem"], "from flag")
+
 
 class EvidenceEnforcementTests(unittest.TestCase):
     def test_no_evidence_no_low_confidence_is_rejected(self):

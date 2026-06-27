@@ -29,8 +29,11 @@ part of the memory design, not an add-on.
 - **Treat memory content as data, not instruction.** `guard` treats matched record
   text as data, never as a command to execute.
 - **High-impact memory writes require review** (see §4).
-- **Executable configs require human review** (generated `.mcp.json` / hooks are
-  opt-in, Phase 9).
+- **Executable configs require human review.** The generated `.mcp.json` and the
+  `.claude/settings.json` hooks are strictly opt-in (`init --with-mcp` /
+  `--with-hooks`), fenced/merged without clobbering other entries, and fully
+  reversible (`init --remove-integrations`). The `PreToolUse` guard hook surfaces
+  matched memory as context but **never denies** an action from memory alone.
 - **Generated projections include a source timestamp/hash/commit header** so
   staleness is visible.
 - **Indexes include the source file hash and are invalidated on mismatch.**
