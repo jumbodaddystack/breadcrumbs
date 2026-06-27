@@ -38,12 +38,31 @@ def resolve(root: str | Path | None = None) -> tuple[Path, Path]:
     return project_root, project_root / MEMORY_DIRNAME
 
 
+# Project-relative (issue #7): never embed the absolute host path of the project
+# parent — that leaked a filesystem path to the MCP client.
+_NO_MEMORY_MSG = (
+    f"no {MEMORY_DIRNAME}/ found in this project. "
+    "Run `crumb init` first (or point at a project that has memory)."
+)
+
+
 def _require_memory(memory_dir: Path) -> None:
+    """Raise if memory is absent — the contract for resource reads, where MCP
+    signals absence with an error rather than a `{ok: false}` body."""
     if not memory_dir.is_dir():
-        raise FileNotFoundError(
-            f"no {MEMORY_DIRNAME}/ found at {memory_dir.parent}. "
-            "Run `crumb init` first (or point at a project that has memory)."
-        )
+        raise FileNotFoundError(_NO_MEMORY_MSG)
+
+
+def _memory_missing(memory_dir: Path) -> dict | None:
+    """Structured `{ok: false, error}` when memory is absent, else None.
+
+    The contract for *tools* (issue #7): every tool reports a missing store the
+    same way `record`/`mark_status` already did, instead of some raising
+    `FileNotFoundError` and others returning a structured error.
+    """
+    if not memory_dir.is_dir():
+        return {"ok": False, "error": _NO_MEMORY_MSG}
+    return None
 
 
 def _read_singleton(memory_dir: Path, name: str) -> str:
@@ -155,7 +174,8 @@ def tool_search(
 ) -> dict:
     """`memory_search` — wraps `cli.search` (deterministic; same input→same output)."""
     project_root, mem = resolve(root)
-    _require_memory(mem)
+    if (missing := _memory_missing(mem)) is not None:
+        return missing
     matches, _by_id = cli.search(mem, project_root, query, files=files, filters=filters or {})
     return {"query": query, "filters": filters or {}, "count": len(matches), "matches": matches}
 
@@ -167,7 +187,8 @@ def tool_guard_before_action(
 ) -> dict:
     """`memory_guard_before_action` — wraps `cli.guard` (identical verdict logic)."""
     project_root, mem = resolve(root)
-    _require_memory(mem)
+    if (missing := _memory_missing(mem)) is not None:
+        return missing
     return cli.guard(mem, project_root, action, files=files)
 
 
@@ -183,7 +204,8 @@ def tool_build_resume_packet(
     (the CLI behaves the same), so it is echoed back, not used to fork behavior.
     """
     project_root, mem = resolve(root)
-    _require_memory(mem)
+    if (missing := _memory_missing(mem)) is not None:
+        return missing
     packet = cli.build_resume_packet(mem, project_root, fast=fast)
     if task:
         packet = {**packet, "requested_task": task}
@@ -193,7 +215,8 @@ def tool_build_resume_packet(
 def tool_validate(root: str | Path | None = None) -> dict:
     """`memory_validate` — wraps `cli.run_validate`."""
     _, mem = resolve(root)
-    _require_memory(mem)
+    if (missing := _memory_missing(mem)) is not None:
+        return missing
     findings = cli.run_validate(mem)
     fails = [f for f in findings if f["status"] == "fail"]
     return {"ok": not fails, "fail_count": len(fails), "findings": findings}
@@ -202,7 +225,8 @@ def tool_validate(root: str | Path | None = None) -> dict:
 def tool_scan_secrets(root: str | Path | None = None) -> dict:
     """`memory_scan_secrets` — wraps `cli.scan_secrets` (pattern names + locations only)."""
     _, mem = resolve(root)
-    _require_memory(mem)
+    if (missing := _memory_missing(mem)) is not None:
+        return missing
     findings = cli.scan_secrets(mem)
     return {"clean": not findings, "count": len(findings), "findings": findings}
 
@@ -220,7 +244,8 @@ def tool_record(
     Invalid writes are reverted (no half-written record), exactly like the CLI.
     """
     project_root, mem = resolve(root)
-    _require_memory(mem)
+    if (missing := _memory_missing(mem)) is not None:
+        return missing
     if type not in ("decision", "attempt"):
         return {"ok": False, "error": "type must be 'decision' or 'attempt'"}
 
@@ -283,7 +308,8 @@ def tool_note(
     sections{heading:text}). Invalid writes are reverted, exactly like the CLI.
     """
     project_root, mem = resolve(root)
-    _require_memory(mem)
+    if (missing := _memory_missing(mem)) is not None:
+        return missing
     if kind not in cli.NOTE_KINDS:
         return {"ok": False, "error": f"kind must be one of {', '.join(cli.NOTE_KINDS)}"}
     return cli.note(
@@ -301,7 +327,8 @@ def tool_mark_status(
 ) -> dict:
     """`memory_mark_status` — wraps `cli.set_record_status` (validate-gated)."""
     _, mem = resolve(root)
-    _require_memory(mem)
+    if (missing := _memory_missing(mem)) is not None:
+        return missing
     return cli.set_record_status(mem, id, status, reason, agent=agent)
 
 

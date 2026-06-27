@@ -5,6 +5,33 @@ The format follows [Keep a Changelog](https://keepachangelog.com/), and the proj
 uses semantic versioning. The package version is independent of the on-disk record
 `schema_version` (still `1`); `crumb --version` prints both.
 
+## [0.1.3] — 2026-06-27
+
+Resolves the four issues deferred from the 2026-06-26 full-codebase bug review
+(#4). No behavior changes to stored data; the CLI remains the single source of
+behavior.
+
+### Fixed
+- **Secret scanner** now flags a long hex token when it sits behind a credential
+  label (`token:`, `Authorization:` without "Bearer", `X-…-Key:` / `X-…-Token:`
+  headers) via a new `labeled-hex-secret` pattern. A bare git sha / `inputs_hash`
+  digest stays unflagged, preserving the deliberate false-negative tradeoff (#5).
+- **MCP tool inputs** advertise structured schemas instead of opaque `dict`:
+  `memory_search` filters and `memory_record` payload are now `TypedDict`s, so the
+  derived JSON Schema lists properties and marks `title` required (#6).
+- **MCP error contract** unified — every tool returns `{ok: false, error}` when no
+  memory store exists (matching `memory_record` / `memory_mark_status`), instead of
+  some tools raising `FileNotFoundError`. The message is now project-relative and no
+  longer leaks the absolute host path. Resources still raise (the correct MCP
+  resource contract) but share the same message (#7).
+- **Cleanup batch (#8):** clear "tabs are not allowed" parser error for tab-indented
+  frontmatter; removed the `audit` double trailing newline; non-canonical
+  frontmatter keys are preserved on a status change; `inputs_hash` is read only from
+  the generated source-header (not a stray match in body text); manifest values are
+  unquoted; no redundant identity `pass` alongside a duplicate-id fail; future-dated
+  handoffs render as a clock-skew note instead of a negative age; the omitted-note
+  wording distinguishes a per-section cap from the token budget.
+
 ## [0.1.2] — 2026-06-27
 
 Implements the fixes from the 2026-06-26 agentic review. The headline change makes

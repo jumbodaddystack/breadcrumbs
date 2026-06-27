@@ -27,8 +27,60 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from typing import TypedDict
 
 from breadcrumbs import mcp_core
+
+
+# --------------------------------------------------------------------------- #
+# Structured tool-input schemas (issue #6)
+# --------------------------------------------------------------------------- #
+# `memory_search`/`memory_record` used to advertise opaque `dict` inputs, so
+# FastMCP (which derives the JSON Schema from the annotations) gave clients no
+# signal about which keys exist or are required. These TypedDicts expose the keys
+# the wrappers actually read — the runtime behavior is unchanged, the core
+# adapters still accept plain dicts. Required vs. optional is encoded with
+# TypedDict inheritance (a subclass defaults to total=True for its own keys while
+# inherited keys keep their not-required status), which needs no `Required`
+# import and works on every supported Python.
+
+
+class SearchFilters(TypedDict, total=False):
+    """Optional filters for `memory_search` (mirrors `_passes_filters`)."""
+
+    type: str  # "decision" | "attempt"
+    status: str  # "active" | "stale" | "superseded" | …
+    tag: str  # case-insensitive tag match
+    file: str  # records touching this path
+
+
+class EvidenceItem(TypedDict):
+    """One evidence ref attached to a record."""
+
+    type: str  # e.g. "commit" | "file" | "test"
+    ref: str
+
+
+class _RecordPayloadOptional(TypedDict, total=False):
+    sections: dict[str, str]  # heading -> body text
+    evidence: list[EvidenceItem]
+    tags: list[str]
+    confidence: str  # "high" | "medium" | "low"
+    privacy: str
+    scope: str
+    status: str
+    agent: str
+
+
+class RecordPayload(_RecordPayloadOptional):
+    """Payload for `memory_record` (mirrors the `remember` CLI surface).
+
+    `title` is the only required key; everything else is optional. The subclass
+    defaults to total=True for its own keys, so `title` is required while the
+    inherited keys above stay optional.
+    """
+
+    title: str
 
 try:  # The SDK is optional; importing this module must never hard-fail.
     from mcp.server.fastmcp import FastMCP
@@ -139,7 +191,7 @@ def build_server():  # -> FastMCP
 
     @mcp.tool()
     def memory_search(
-        query: str, filters: dict | None = None, files: list[str] | None = None
+        query: str, filters: SearchFilters | None = None, files: list[str] | None = None
     ) -> dict:
         """Deterministic search over canonical records (wraps `crumb search`).
 
@@ -149,7 +201,7 @@ def build_server():  # -> FastMCP
         return mcp_core.tool_search(query, filters=filters, files=files, root=_root())
 
     @mcp.tool()
-    def memory_record(type: str, payload: dict) -> dict:
+    def memory_record(type: str, payload: RecordPayload) -> dict:
         """Write a durable decision/attempt; passes the same validate gate as the CLI."""
         return mcp_core.tool_record(type, payload, root=_root())
 

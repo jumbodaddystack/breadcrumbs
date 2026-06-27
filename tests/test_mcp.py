@@ -245,11 +245,74 @@ class GracefulDegradationTests(unittest.TestCase):
             self.skipTest("MCP SDK is installed")
         self.assertEqual(mcp_server.main([]), 1)
 
-    def test_missing_memory_dir_is_a_clear_error_not_a_crash(self):
+    def test_missing_memory_dir_resources_raise_project_relative(self):
+        """Resources still signal absence by raising — but with no host path (issue #7)."""
         empty = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, empty, ignore_errors=True)
-        with self.assertRaises(FileNotFoundError):
+        with self.assertRaises(FileNotFoundError) as ctx:
             mcp_core.resource_current(empty)
+        msg = str(ctx.exception)
+        self.assertIn("Run `crumb init`", msg)
+        self.assertNotIn(str(empty), msg)  # no absolute host path leaked
+        self.assertNotIn(str(empty.parent), msg)
+
+    def test_missing_memory_dir_tools_return_structured_error(self):
+        """Every tool reports a missing store as {ok: False, error} (issue #7)."""
+        empty = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, empty, ignore_errors=True)
+        calls = (
+            lambda: mcp_core.tool_search("q", root=empty),
+            lambda: mcp_core.tool_guard_before_action("do x", root=empty),
+            lambda: mcp_core.tool_build_resume_packet(root=empty),
+            lambda: mcp_core.tool_validate(root=empty),
+            lambda: mcp_core.tool_scan_secrets(root=empty),
+            lambda: mcp_core.tool_record("decision", {"title": "x"}, root=empty),
+            lambda: mcp_core.tool_note("question", "x", root=empty),
+            lambda: mcp_core.tool_mark_status("dec_x", "stale", "why", root=empty),
+        )
+        for call in calls:
+            res = call()
+            self.assertIsInstance(res, dict)
+            self.assertFalse(res.get("ok", None), res)
+            self.assertIn("error", res)
+            self.assertNotIn(str(empty), res["error"])  # no host path leaked
+
+
+# --------------------------------------------------------------------------- #
+# Issue #6 — tool inputs advertise structured schemas, not opaque dicts
+# --------------------------------------------------------------------------- #
+class InputSchemaTests(unittest.TestCase):
+    def test_search_filters_typeddict_keys(self):
+        self.assertEqual(
+            set(mcp_server.SearchFilters.__optional_keys__),
+            {"type", "status", "tag", "file"},
+        )
+        self.assertEqual(set(mcp_server.SearchFilters.__required_keys__), set())
+
+    def test_record_payload_requires_title_only(self):
+        self.assertEqual(set(mcp_server.RecordPayload.__required_keys__), {"title"})
+        self.assertEqual(
+            set(mcp_server.RecordPayload.__optional_keys__),
+            {"sections", "evidence", "tags", "confidence", "privacy", "scope",
+             "status", "agent"},
+        )
+
+    def test_evidence_item_keys(self):
+        self.assertEqual(set(mcp_server.EvidenceItem.__required_keys__), {"type", "ref"})
+
+    def test_tools_advertise_properties_when_sdk_present(self):
+        if not mcp_server.sdk_available():
+            self.skipTest("MCP SDK not installed; schema derivation not exercised")
+        server = mcp_server.build_server()
+        tools = {t.name: t for t in server._tool_manager.list_tools()}
+        record_schema = tools["memory_record"].parameters
+        payload_schema = record_schema["properties"]["payload"]
+        # FastMCP/pydantic may inline or $ref the TypedDict; resolve a $ref.
+        if "$ref" in payload_schema:
+            ref = payload_schema["$ref"].split("/")[-1]
+            payload_schema = record_schema["$defs"][ref]
+        self.assertIn("title", payload_schema.get("properties", {}))
+        self.assertIn("title", payload_schema.get("required", []))
 
 
 if __name__ == "__main__":

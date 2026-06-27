@@ -344,5 +344,78 @@ class McpAdapterTests(unittest.TestCase):
                 mcp_core.resource_attempt(did, root=str(root))
 
 
+# --------------------------------------------------------------------------- #
+# Group 9 — low-severity cleanup batch (issue #8)
+# --------------------------------------------------------------------------- #
+from datetime import datetime, timedelta  # noqa: E402
+
+
+class CleanupBatchTests(unittest.TestCase):
+    def test_8_1_tab_indentation_gives_clear_error(self):
+        """A tab-indented frontmatter line says 'tabs', not a misleading error."""
+        with self.assertRaises(crumb.FrontmatterError) as ctx:
+            crumb.parse_frontmatter("---\n\tkey: value\n---\nbody\n")
+        self.assertIn("tab", str(ctx.exception).lower())
+
+    def test_8_1_tab_indented_list_item_gives_clear_error(self):
+        with self.assertRaises(crumb.FrontmatterError) as ctx:
+            crumb.parse_frontmatter("---\ntags:\n\t- a\n---\nbody\n")
+        self.assertIn("tab", str(ctx.exception).lower())
+
+    def test_8_2_audit_render_has_no_trailing_newline(self):
+        self.assertFalse(crumb.render_audit_human([]).endswith("\n"))
+        findings = [
+            {"severity": crumb.AUDIT_FAIL, "check": "secret", "path": "x", "message": "m"}
+        ]
+        self.assertFalse(crumb.render_audit_human(findings).endswith("\n"))
+
+    def test_8_3_render_frontmatter_keeps_non_canonical_keys(self):
+        meta = {"id": "dec_x", "type": "decision", "status": "active", "custom_key": "keep me"}
+        out = crumb.render_frontmatter(meta)
+        self.assertIn("custom_key: keep me", out)
+
+    def test_8_4_stamped_inputs_hash_only_reads_header(self):
+        text = (
+            "<!-- source_commit: abc | inputs_hash: deadbeef1234 | generated_at: t -->\n"
+            "prose that mentions inputs_hash: cafef00d9999 in the body\n"
+        )
+        self.assertEqual(crumb._stamped_inputs_hash(text), "deadbeef1234")
+
+    def test_8_4_stray_body_inputs_hash_is_not_picked_up(self):
+        text = "no generated header\nbut a stray inputs_hash: cafef00d9999 in prose\n"
+        self.assertIsNone(crumb._stamped_inputs_hash(text))
+
+    def test_8_5_load_manifest_unquotes_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mem = Path(tmp)
+            (mem / "manifest.yml").write_text(
+                'schema_version: "1"\nproject: \'demo\'\nplain: bare\n', encoding="utf-8"
+            )
+            man = crumb.load_manifest(mem)
+            self.assertEqual(man["schema_version"], "1")
+            self.assertEqual(man["project"], "demo")
+            self.assertEqual(man["plain"], "bare")
+
+    def test_8_7_future_handoff_age_is_not_negative_days(self):
+        future = (datetime.now().astimezone() + timedelta(days=5)).isoformat()
+        with tempfile.TemporaryDirectory() as tmp:
+            warnings = crumb.compute_staleness(
+                Path(tmp), {"updated_at": future}, [], [], [], 14
+            )
+        joined = " ".join(warnings)
+        self.assertNotIn("day(s) old", joined)
+        self.assertIn("future", joined)
+
+    def test_8_8_omitted_note_reason_is_accurate(self):
+        cap = {"omitted": {"k": 3}, "omitted_reason": {"k": "the per-section cap"}}
+        self.assertIn("per-section cap", crumb._omitted_note(cap, "k")[0])
+        budget = {"omitted": {"k": 2}, "omitted_reason": {"k": "the token budget"}}
+        self.assertIn("token budget", crumb._omitted_note(budget, "k")[0])
+        # A packet built before this field existed defaults to the budget wording.
+        legacy = {"omitted": {"k": 1}}
+        self.assertIn("token budget", crumb._omitted_note(legacy, "k")[0])
+        self.assertEqual(crumb._omitted_note({"omitted": {}}, "k"), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

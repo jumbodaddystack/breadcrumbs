@@ -51,7 +51,7 @@ TEMPLATE_DIR = Path(__file__).resolve().parent / "templates" / "project-memory"
 # Dev/source-checkout fallback version. The installed distribution's version is
 # authoritative (read from package metadata in get_version); keep this in sync
 # with `version` in pyproject.toml for source-tree runs where no metadata exists.
-_FALLBACK_VERSION = "0.1.2"
+_FALLBACK_VERSION = "0.1.3"
 
 # Non-git fallback sentinels (build plan §22 Q5, resolved this phase).
 # Used everywhere git-derived fields cannot be populated.
@@ -465,6 +465,16 @@ def _indent(line: str) -> int:
     return len(line) - len(line.lstrip(" "))
 
 
+def _has_tab_indent(line: str) -> bool:
+    """True if the line's leading whitespace contains a tab.
+
+    `_indent` counts only spaces, so a tab-indented line would otherwise read as
+    un-indented and trip a misleading "expected 'key: value'" / "unexpected
+    indentation" error. YAML forbids tabs for indentation, so we say so plainly.
+    """
+    return "\t" in line[: len(line) - len(line.lstrip())]
+
+
 def _strip_inline_comment(val: str) -> str:
     """Drop a ` # ...` trailing comment from an unquoted scalar (YAML convention)."""
     if " #" in val:
@@ -512,6 +522,10 @@ def _parse_list(lines: list[str]) -> list:
         if not line.strip() or line.lstrip().startswith("#"):
             i += 1
             continue
+        if _has_tab_indent(line):
+            raise FrontmatterError(
+                f"tabs are not allowed for indentation (use spaces): {line!r}"
+            )
         stripped = line.strip()
         if not stripped.startswith("-"):
             raise FrontmatterError(f"expected list item, got: {line!r}")
@@ -552,6 +566,10 @@ def _parse_mapping(lines: list[str]) -> dict:
         if not raw.strip() or raw.lstrip().startswith("#"):
             i += 1
             continue
+        if _has_tab_indent(raw):
+            raise FrontmatterError(
+                f"tabs are not allowed for indentation (use spaces): {raw!r}"
+            )
         if _indent(raw) != 0:
             raise FrontmatterError(f"unexpected indentation at top level: {raw!r}")
         stripped = raw.rstrip()
@@ -806,7 +824,10 @@ def load_manifest(memory_dir: Path) -> dict | None:
         if not line or ":" not in line:
             continue
         key, _, val = line.partition(":")
-        out[key.strip()] = val.strip()
+        val = val.strip()
+        if len(val) >= 2 and val[0] in "\"'" and val[-1] == val[0]:
+            val = val[1:-1]  # unquote so `schema_version: "1"` compares as `1`
+        out[key.strip()] = val
     return out
 
 
@@ -885,7 +906,8 @@ def run_validate(memory_dir: Path) -> list[dict]:
             )
         else:
             rid, slug = ident
-            if rid in seen_ids:
+            is_duplicate = rid in seen_ids
+            if is_duplicate:
                 findings.append(
                     _finding("identity", "fail", rel, f"duplicate id {rid!r} (also {seen_ids[rid]})")
                 )
@@ -903,7 +925,9 @@ def run_validate(memory_dir: Path) -> list[dict]:
                 disagree.append(f"type frontmatter {stored_type!r} != directory {rec.rtype!r}")
             if disagree:
                 findings.append(_finding("identity", "fail", rel, "; ".join(disagree)))
-            else:
+            elif not is_duplicate:
+                # A duplicate already produced a fail; don't also emit a redundant
+                # identity pass that would inflate the passed count.
                 findings.append(_finding("identity", "pass", rel, f"id {rid}"))
 
         # 16.5 — status in vocabulary.
@@ -1197,9 +1221,15 @@ def _render_scalar(v, in_list: bool = False) -> str:
 
 
 def render_frontmatter(meta: dict) -> str:
-    """Render a frontmatter dict into the YAML subset the parser accepts."""
+    """Render a frontmatter dict into the YAML subset the parser accepts.
+
+    Canonical keys are emitted in `FRONTMATTER_ORDER`; any non-canonical keys
+    present on the record follow in insertion order, so a re-render (e.g. on a
+    status change) never silently drops keys the writer didn't know about.
+    """
     lines = ["---"]
-    for key in FRONTMATTER_ORDER:
+    extra_keys = [k for k in meta if k not in FRONTMATTER_ORDER]
+    for key in (*FRONTMATTER_ORDER, *extra_keys):
         if key not in meta:
             continue
         v = meta[key]
@@ -2355,7 +2385,11 @@ def compute_staleness(
     if age is not None or dist is not None:
         parts = []
         if age is not None:
-            parts.append(f"{age} day(s) old")
+            # A future timestamp (clock skew / edited-ahead date) yields a negative
+            # age — don't render the nonsensical "-1 day(s) old".
+            parts.append(
+                "timestamped in the future (clock skew?)" if age < 0 else f"{age} day(s) old"
+            )
         if dist is not None:
             parts.append(f"written {dist} commit(s) behind current HEAD")
         cold = (age is not None and age > stale_days) or (dist is not None and dist >= 10)
@@ -2524,6 +2558,7 @@ def build_resume_packet(
         "verification": [],
         "warnings": compute_staleness(root, handoff_meta, decisions, attempts, questions, stale_days),
         "omitted": {},
+        "omitted_reason": {},
     }
 
     # Likely files: handoff section + file-type evidence refs (deduped, order-stable).
@@ -2562,13 +2597,15 @@ def _bound_packet(packet: dict, *, fast: bool) -> None:
         for key in _FAST_DROP:
             packet[key] = []
         packet["omitted"] = {}
+        packet["omitted_reason"] = {}
         return
 
-    # Per-section caps (record how many we hid).
+    # Per-section caps (record how many we hid, and why).
     for key, cap in SECTION_CAPS.items():
         items = packet.get(key, [])
         if len(items) > cap:
             packet["omitted"][key] = packet["omitted"].get(key, 0) + (len(items) - cap)
+            packet["omitted_reason"][key] = "the per-section cap"
             packet[key] = items[:cap]
 
     # Budget trim, lowest-priority section first, until within the ceiling.
@@ -2577,6 +2614,13 @@ def _bound_packet(packet: dict, *, fast: bool) -> None:
             if packet.get(key):
                 packet[key].pop()
                 packet["omitted"][key] = packet["omitted"].get(key, 0) + 1
+                # A key already capped is now also budget-trimmed — record both.
+                prior = packet["omitted_reason"].get(key)
+                packet["omitted_reason"][key] = (
+                    "the per-section cap and token budget"
+                    if prior == "the per-section cap"
+                    else "the token budget"
+                )
                 break
         else:
             break  # nothing left to trim; emit slightly over rather than loop forever
@@ -2586,7 +2630,10 @@ def _bound_packet(packet: dict, *, fast: bool) -> None:
 
 def _omitted_note(packet: dict, key: str) -> list[str]:
     n = packet.get("omitted", {}).get(key, 0)
-    return [f"_(… {n} more omitted to stay within the token budget)_"] if n else []
+    if not n:
+        return []
+    reason = packet.get("omitted_reason", {}).get(key, "the token budget")
+    return [f"_(… {n} more omitted to stay within {reason})_"]
 
 
 def render_packet_markdown(packet: dict) -> str:
@@ -3445,6 +3492,21 @@ SECRET_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
             r"['\"]?([A-Za-z0-9/+_\-]{16,})['\"]?"
         ),
     ),
+    # A bare lowercase-hex token is shape-identical to the SHA-1/256 digests
+    # (commit refs, evidence refs, inputs_hash) that fill project memory, so the
+    # standalone high-entropy heuristic deliberately can't flag it (see
+    # `_looks_high_entropy`). We close the leak only in a *labeled* credential
+    # context, where a standalone sha is unlikely — covering the labels the
+    # `secret-assignment` keyword list above misses: bare `token:`,
+    # `Authorization:` (no "Bearer", so `bearer-token` skips it), and
+    # `X-…-Key:` / `X-…-Token:` HTTP headers. No label ⇒ still no flag.
+    (
+        "labeled-hex-secret",
+        re.compile(
+            r"(?i)\b(?:token|authorization|x-[a-z0-9-]*-(?:key|token))\b\s*[:=]\s*"
+            r"['\"]?[0-9a-fA-F]{32,}\b"
+        ),
+    ),
 )
 
 # Standalone high-entropy tokens (base64-ish). The charset excludes `_`/`-`, so
@@ -3553,6 +3615,11 @@ def _looks_high_entropy(tok: str) -> bool:
     a real entropy floor. Conservative by design — misses some secrets, flags ~no ids.
     Path- and identifier-shaped tokens are allowlisted (review §6.4) without lowering
     the entropy floor, so real secrets are unaffected.
+
+    A bare lowercase-hex token (a 32–64 char hex API key) is intentionally NOT
+    caught here: it is indistinguishable from the git shas / inputs_hash digests
+    that fill memory. Such tokens are flagged only in a labeled credential
+    context by the `labeled-hex-secret` pattern above (issue #5).
     """
     if not (
         any(c.islower() for c in tok)
@@ -3643,7 +3710,10 @@ def scan_instruction_like(memory_dir: Path) -> list[dict]:
 # ---- generated-packet drift ------------------------------------------------ #
 
 def _stamped_inputs_hash(text: str) -> str | None:
-    m = re.search(r"inputs_hash:\s*([0-9a-f]+)", text)
+    # Anchor to the generated source-header comment (written by render_packet_*
+    # as `<!-- source_commit: … | inputs_hash: <hash> | … -->`) rather than the
+    # whole file, so a stray `inputs_hash:` in copied body text isn't picked up.
+    m = re.search(r"<!--\s*source_commit:.*?\binputs_hash:\s*([0-9a-f]+)", text)
     return m.group(1) if m else None
 
 
@@ -3852,7 +3922,8 @@ def render_audit_human(findings: list[dict]) -> str:
     warns = [f for f in findings if f["severity"] == AUDIT_WARN]
     infos = [f for f in findings if f["severity"] == AUDIT_INFO]
     if not findings:
-        return "audit: OK — no problems, warnings, or notes.\n"
+        # No trailing newline: the sole caller prints this, which adds one.
+        return "audit: OK — no problems, warnings, or notes."
 
     out: list[str] = [
         f"audit: {len(fails)} problem(s), {len(warns)} warning(s), {len(infos)} note(s).",
@@ -3873,7 +3944,7 @@ def render_audit_human(findings: list[dict]) -> str:
         for f in infos:
             out.append(f"  • [{f['check']}] {f['path'] or '-'}: {f['message']}")
         out.append("")
-    return "\n".join(out).rstrip() + "\n"
+    return "\n".join(out).rstrip()
 
 
 def cmd_audit(args: argparse.Namespace) -> int:
