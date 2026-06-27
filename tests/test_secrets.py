@@ -113,6 +113,46 @@ class SecretShapeTests(unittest.TestCase):
         jwt = "eyJhbGciOiJIUzI1Ni.eyJzdWIiOiIxMjM0NTY3.SflKxwRJSMeKKF2QT4f"
         self.assertIn("jwt", self._scan_line(jwt))
 
+    def test_labeled_hex_secret(self):
+        """Long hex IS flagged when it sits behind a credential label (issue #5)."""
+        hex40 = "a" * 8 + "b" * 8 + "c" * 8 + "d" * 8 + "e" * 8  # 40 lowercase-hex
+        for line in (
+            f"token: {hex40}",
+            f"Authorization: {hex40}",
+            f"X-Api-Key: {hex40}",
+            f"x-auth-token={hex40}",
+        ):
+            self.assertIn("labeled-hex-secret", self._scan_line(line), line)
+
+
+# --------------------------------------------------------------------------- #
+# Issue #5 — the labeled-hex pattern must not reopen the bare-sha tradeoff
+# --------------------------------------------------------------------------- #
+class LabeledHexTradeoffTests(unittest.TestCase):
+    def _scan_line(self, line: str) -> set[str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            mem = fresh_store(tmp)
+            (mem / "decisions" / "2026-06-25-h.md").write_text(line + "\n", encoding="utf-8")
+            return patterns_hit(mem)
+
+    def test_bare_hex_and_sha_labels_are_still_not_flagged(self):
+        """A standalone sha — and the sha-bearing labels memory uses — stay quiet."""
+        sha40 = "a" * 8 + "b" * 8 + "c" * 8 + "d" * 8 + "e" * 8
+        for line in (
+            sha40,                       # bare hex on its own line
+            f"commit: {sha40}",          # commit ref
+            f"inputs_hash: {sha40}",     # generated header stamp
+            f"ref: {sha40}",             # evidence ref
+        ):
+            self.assertNotIn("labeled-hex-secret", self._scan_line(line), line)
+
+    def test_query_string_token_prose_is_not_flagged(self):
+        """`?token=` followed by prose (not hex) must not trip the labeled pattern."""
+        self.assertNotIn(
+            "labeled-hex-secret",
+            self._scan_line("Send the auth token as a ?token= query parameter."),
+        )
+
 
 # --------------------------------------------------------------------------- #
 # False-positive controls — the scanner must stay quiet on normal memory

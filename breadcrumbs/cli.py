@@ -3445,6 +3445,21 @@ SECRET_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
             r"['\"]?([A-Za-z0-9/+_\-]{16,})['\"]?"
         ),
     ),
+    # A bare lowercase-hex token is shape-identical to the SHA-1/256 digests
+    # (commit refs, evidence refs, inputs_hash) that fill project memory, so the
+    # standalone high-entropy heuristic deliberately can't flag it (see
+    # `_looks_high_entropy`). We close the leak only in a *labeled* credential
+    # context, where a standalone sha is unlikely — covering the labels the
+    # `secret-assignment` keyword list above misses: bare `token:`,
+    # `Authorization:` (no "Bearer", so `bearer-token` skips it), and
+    # `X-…-Key:` / `X-…-Token:` HTTP headers. No label ⇒ still no flag.
+    (
+        "labeled-hex-secret",
+        re.compile(
+            r"(?i)\b(?:token|authorization|x-[a-z0-9-]*-(?:key|token))\b\s*[:=]\s*"
+            r"['\"]?[0-9a-fA-F]{32,}\b"
+        ),
+    ),
 )
 
 # Standalone high-entropy tokens (base64-ish). The charset excludes `_`/`-`, so
@@ -3553,6 +3568,11 @@ def _looks_high_entropy(tok: str) -> bool:
     a real entropy floor. Conservative by design — misses some secrets, flags ~no ids.
     Path- and identifier-shaped tokens are allowlisted (review §6.4) without lowering
     the entropy floor, so real secrets are unaffected.
+
+    A bare lowercase-hex token (a 32–64 char hex API key) is intentionally NOT
+    caught here: it is indistinguishable from the git shas / inputs_hash digests
+    that fill memory. Such tokens are flagged only in a labeled credential
+    context by the `labeled-hex-secret` pattern above (issue #5).
     """
     if not (
         any(c.islower() for c in tok)
