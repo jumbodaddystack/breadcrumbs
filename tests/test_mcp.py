@@ -252,5 +252,42 @@ class GracefulDegradationTests(unittest.TestCase):
             mcp_core.resource_current(empty)
 
 
+# --------------------------------------------------------------------------- #
+# Issue #6 — tool inputs advertise structured schemas, not opaque dicts
+# --------------------------------------------------------------------------- #
+class InputSchemaTests(unittest.TestCase):
+    def test_search_filters_typeddict_keys(self):
+        self.assertEqual(
+            set(mcp_server.SearchFilters.__optional_keys__),
+            {"type", "status", "tag", "file"},
+        )
+        self.assertEqual(set(mcp_server.SearchFilters.__required_keys__), set())
+
+    def test_record_payload_requires_title_only(self):
+        self.assertEqual(set(mcp_server.RecordPayload.__required_keys__), {"title"})
+        self.assertEqual(
+            set(mcp_server.RecordPayload.__optional_keys__),
+            {"sections", "evidence", "tags", "confidence", "privacy", "scope",
+             "status", "agent"},
+        )
+
+    def test_evidence_item_keys(self):
+        self.assertEqual(set(mcp_server.EvidenceItem.__required_keys__), {"type", "ref"})
+
+    def test_tools_advertise_properties_when_sdk_present(self):
+        if not mcp_server.sdk_available():
+            self.skipTest("MCP SDK not installed; schema derivation not exercised")
+        server = mcp_server.build_server()
+        tools = {t.name: t for t in server._tool_manager.list_tools()}
+        record_schema = tools["memory_record"].parameters
+        payload_schema = record_schema["properties"]["payload"]
+        # FastMCP/pydantic may inline or $ref the TypedDict; resolve a $ref.
+        if "$ref" in payload_schema:
+            ref = payload_schema["$ref"].split("/")[-1]
+            payload_schema = record_schema["$defs"][ref]
+        self.assertIn("title", payload_schema.get("properties", {}))
+        self.assertIn("title", payload_schema.get("required", []))
+
+
 if __name__ == "__main__":
     unittest.main()
