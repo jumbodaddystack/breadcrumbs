@@ -5,11 +5,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/), and the proj
 uses semantic versioning. The package version is independent of the on-disk record
 `schema_version` (still `1`); `crumb --version` prints both.
 
-## [Unreleased]
+## [0.1.4] — 2026-06-29
 
 Resolves the high-leverage findings from the second agentic review (MCP
-integration, write path, cloud portability). The CLI remains the single source of
-behavior; the MCP layer stays a thin wrapper over it.
+integration, write path, cloud portability — `docs/crumb-kit-agentic-review-2026-06-27.md`).
+The CLI remains the single source of behavior; the MCP layer stays a thin wrapper
+over it. The on-disk record `schema_version` is unchanged (still `1`): the new
+`verification` records use the same frontmatter contract as existing record types.
 
 ### Added
 - **`verification` record type (F1)** — a first-class home for "I checked X; here
