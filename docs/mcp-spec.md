@@ -72,18 +72,31 @@ unknown `{id}` raises (surfaced to the client as a resource error). A missing
 Prompts return guidance text only. They carry **no authority** over the user's
 current instruction, the code, the tests, or authoritative docs (plan §15).
 
-## Tools (8) — wrap existing functions
+## Tools (10) — wrap existing functions
 
 | Tool | Signature | Wraps | Output |
 |---|---|---|---|
 | `memory_search` | `(query, filters?)` | `cli.search` | `{query, filters, count, matches[]}` |
-| `memory_record` | `(type, payload)` | `cli.write_record` + validate gate | `{ok, id, type, path, confidence}` or `{ok:false, error}` |
+| `memory_record` | `(type, payload)` | `cli.write_record` + validate gate, reindex | `{ok, id, type, path, confidence}` or `{ok:false, error}` |
+| `memory_verify` | `(subject, status, method?, note?, evidence?, tags?, confidence?)` | `cli.verify` + validate gate, reindex | `{ok, id, subject, outcome, method, confidence, path}` or `{ok:false, error}` |
 | `memory_note` | `(kind, text, fields?, tags?)` | `cli.note` | `{ok, kind, ref|id, path}` or `{ok:false, error}` |
+| `memory_reindex` | `()` | `cli.reindex_projections` | `{ok, path}` |
 | `memory_guard_before_action` | `(action, files?)` | `cli.guard` | the full guard result (`{verdict, matches, history, staleness, next_action, …}`) |
-| `memory_build_resume_packet` | `(task?)` | `cli.build_resume_packet` | the structured packet dict (with optional echoed `requested_task`) |
-| `memory_validate` | `()` | `cli.run_validate` | `{ok, fail_count, findings[]}` |
-| `memory_mark_status` | `(id, status, reason)` | `cli.set_record_status` | `{ok, id, from, to, path}` or `{ok:false, error}` |
+| `memory_build_resume_packet` | `(task?)` | `cli.build_resume_packet` | the structured packet dict (`task` scopes `likely_files` + echoes `requested_task`) |
+| `memory_validate` | `()` | `cli.run_validate` | `{ok, fail_count, findings[]}` (includes the projection-freshness check) |
+| `memory_mark_status` | `(id, status, reason)` | `cli.set_record_status`, reindex | `{ok, id, from, to, path}` or `{ok:false, error}` |
 | `memory_scan_secrets` | `()` | `cli.scan_secrets` | `{clean, count, findings[]}` (pattern names + locations only) |
+
+### `memory_verify`
+
+The home for a verification result — "I checked X; here is its state" (review
+F1) — instead of mis-filing it as a decision/attempt. `status` is the **outcome**
+(`fixed|open|regressed|not_applicable|inconclusive`); `method` is
+`static|runtime|test`. The record-level lifecycle `status` stays `active`; the
+outcome lives in an `outcome` frontmatter field. Searchable via
+`{type:"verification", status:"open"}` (the `status` filter matches the outcome)
+and surfaced in the resume packet's **Verifications** section. Goes through the
+same validate gate as `memory_record`, and reindexes on write.
 
 ### `memory_note`
 
@@ -132,8 +145,10 @@ rejected (§16.6) and reverted. Use the supersede flow for replacements.
   prior work; it never overrides the user's current instruction, the code, the
   tests, or authoritative docs. `guard` already treats matched text as data;
   the server changes nothing about that.
-- **Writes go through validate.** `memory_record` and `memory_mark_status` reuse
-  the exact validate gate `remember` uses — one write-behavior.
+- **Writes go through validate.** `memory_record`, `memory_verify`, and
+  `memory_mark_status` reuse the exact validate gate `remember` uses — one
+  write-behavior — and each refreshes the `generated/` projections on success so
+  the static snapshots never desync from the records (review F2/F3).
 - **Secret-scan before commit.** `memory_scan_secrets` is available so an agent
   can check before any "commit memory" step (§2.6, §15, Fixture 6).
 - **No new identity scheme.** `find_record_by_id` uses the same filename-canonical

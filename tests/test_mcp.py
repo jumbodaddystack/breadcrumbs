@@ -133,9 +133,20 @@ class ToolParityTests(unittest.TestCase):
         self.assertEqual([m["id"] for m in tool["matches"]], [m["id"] for m in matches])
 
     def test_validate_reports_clean_fixtures(self):
+        # fixture-08 ships a deliberately stale projection; the freshness check
+        # (review F3) now flags it via validate, so it is no longer "clean".
         for name in ALL_FIXTURES:
+            if name == "fixture-08-packet-stale":
+                continue
             with self.subTest(fixture=name):
                 self.assertTrue(mcp_core.tool_validate(root=root_of(name))["ok"])
+
+    def test_validate_flags_stale_projection(self):
+        result = mcp_core.tool_validate(root=root_of("fixture-08-packet-stale"))
+        self.assertFalse(result["ok"])
+        self.assertTrue(
+            any(f["check"] == "freshness" for f in result["findings"] if f["status"] == "fail")
+        )
 
     def test_scan_secrets_flags_only_the_secret_fixture(self):
         clean = mcp_core.tool_scan_secrets(root=root_of("fixture-01-fresh-resume"))

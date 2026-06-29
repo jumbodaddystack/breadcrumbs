@@ -5,6 +5,41 @@ The format follows [Keep a Changelog](https://keepachangelog.com/), and the proj
 uses semantic versioning. The package version is independent of the on-disk record
 `schema_version` (still `1`); `crumb --version` prints both.
 
+## [Unreleased]
+
+Resolves the high-leverage findings from the second agentic review (MCP
+integration, write path, cloud portability). The CLI remains the single source of
+behavior; the MCP layer stays a thin wrapper over it.
+
+### Added
+- **`verification` record type (F1)** — a first-class home for "I checked X; here
+  is its state", the most common agentic output, which previously had to be
+  mis-filed as a decision/attempt. `crumb verify <subject> --status <outcome>
+  --method <static|runtime|test> --evidence …` and the `memory_verify` MCP tool.
+  The record-level `status` stays the lifecycle value; the finding-about-reality
+  lives in an `outcome` field (`fixed|open|regressed|not_applicable|inconclusive`).
+  Verifications are searchable (`crumb search --type verification --status open`,
+  where `status` filters on the outcome) and surfaced in the resume packet under a
+  new **Verifications** section, actionable outcomes first.
+- **`crumb reindex` + `memory_reindex` (F2)** — explicit rebuild of the
+  `generated/` projections from the canonical records.
+- **`crumb mcp doctor` (F11)** — report MCP wiring (the `[mcp]` extra and
+  `.mcp.json` registration) from the CLI's own help surface.
+- **`crumb resume --task` (F4/F6)** — resume *for a task*: `likely_files` is scoped
+  to the records that actually match it (empty + a `starting cold` note when the
+  store has nothing), and the requested task is echoed above the last-session
+  focus so the two are not conflated.
+
+### Fixed
+- **Reindex-on-write (F2)** — every canonical mutation (`remember`, `note`,
+  `verify`, `mark-status`, and their MCP equivalents) now refreshes the
+  `generated/` projections, so the static snapshots can no longer silently desync
+  from the records on the write path.
+- **`validate` projection-freshness check (F3)** — `validate` now fails on a
+  `generated/` projection whose stamped `inputs_hash` no longer matches the live
+  records, with an actionable `Run \`crumb reindex\`` hint. It no longer stays
+  green (and thereby *certifies* drift) on a desynced store.
+
 ## [0.1.3] — 2026-06-27
 
 Resolves the four issues deferred from the 2026-06-26 full-codebase bug review

@@ -103,15 +103,17 @@ crumb init --with-adapter --with-mcp --with-hooks   # ...and wire it into your a
 crumb validate                   # deterministically check the store (schema + invariants)
 crumb schema                     # print the record contract (sections, vocab, rules)
 crumb remember decision          # capture a durable choice
+crumb verify "finding#1" --status fixed   # record a verification result (a finding about reality)
 crumb note question|trap|idea    # leave a note for the next agent (no hand-editing)
 crumb capture session            # record session end (git-prefilled); updates handoff + current
 crumb resume                     # print a bounded resume packet with computed staleness
+crumb reindex                    # rebuild generated/ projections (mutations reindex automatically)
 crumb search "auth middleware"   # deterministic keyword/tag/file lookup over records
 crumb guard "rewrite the auth middleware"   # warn before repeating a known mistake
 crumb audit                      # heuristic health/safety report (stale/unsafe/bloated)
 crumb scan-secrets               # block if committed memory holds token-like strings
 crumb doctor                     # is memory actually wired into your agent?
-crumb mcp serve | register       # run / register the optional MCP server
+crumb mcp serve | register | doctor   # run / register / health-check the optional MCP server
 ```
 
 In this build, `init`, `validate`, `remember`, `capture session`, `resume`,
@@ -185,6 +187,26 @@ refuses to write an invalid record. `--json` emits a machine summary.
 (`--problem`, `--tried`, `--result`, `--why`, `--do-not-retry`, `--related`), so
 the contract is visible in `--help` instead of discoverable only by rejection.
 
+### `crumb verify`
+
+```bash
+python crumb.py verify "perf-audit-2026-05-15#F1" \
+  --status fixed --method static \
+  --evidence file app/DoWhatApplication.kt:170 \
+  --note "DB validation moved to applicationScope.launch(ioDispatcher)"
+```
+
+Records a **verification result** — "I checked X; here is its state" — the most
+common agentic output in maintenance, audits, and "is this bug still real?" work.
+Without a home for it, agents either drop it or mis-file it as a decision/attempt
+and pollute those categories. `--status` is the outcome
+(`fixed|open|regressed|not_applicable|inconclusive`); `--method` is
+`static|runtime|test`. Like a decision/attempt it needs evidence or
+`--confidence low`. Verifications surface in the resume packet's **Verifications**
+section (actionable outcomes first) and are searchable with `crumb search --type
+verification --status open` (here `--status` filters on the outcome). Mirrored
+over MCP as `memory_verify`.
+
 ### `crumb schema`
 
 ```bash
@@ -237,12 +259,14 @@ python crumb.py resume                       # full bounded packet (writes gener
 python crumb.py resume --fast                # git snapshot + focus + next action + staleness (print-only)
 python crumb.py resume --json                # structured packet (sections + warnings) for agents
 python crumb.py resume --stale-days 14       # tighten the aged-unresolved threshold (default 21)
+python crumb.py resume --task "verify the perf audit"   # scope likely-files to matching records (print-only)
 ```
 
 `resume` assembles a **bounded, paste-anywhere packet** (≤5k tokens) from the
 canonical records — project/branch/commit, current focus, next action, active
 decisions (id + one-line rationale), failed attempts to avoid (id + do-not-retry),
-known traps, open questions, likely files, and verification commands — followed by
+known traps, open questions, likely files, verifications (recorded results,
+actionable outcomes first), and verification commands — followed by
 **computed staleness warnings**:
 
 - handoff **age + commit-distance** ("handoff is 6 days old, written 14 commits
@@ -254,9 +278,17 @@ known traps, open questions, likely files, and verification commands — followe
 Current/handoff/active-decisions are prioritized over old session observations, and
 sections are capped then trimmed to stay within budget even with hundreds of
 records. The packet carries a source `commit`/`inputs_hash`/`generated_at` header so
-later `audit` (Phase 6) can detect drift. Raw transcripts are never included.
+both `validate` and `audit` can detect drift. Raw transcripts are never included.
 `--fast` is a print-only reorientation view and does not overwrite the committed
-packet.
+packet. `--task TEXT` scopes **Likely Relevant Files** to the records that actually
+match the task (and labels an empty result `starting cold` rather than falling back
+to store-global noise); it is likewise print-only.
+
+Mutations (`remember`, `note`, `verify`, `mark-status`, and their MCP equivalents)
+**reindex on write**, so `generated/resume-packet.md` never silently desyncs from
+the records. `crumb reindex` rebuilds it explicitly (e.g. after a hand-edit), and
+`crumb validate` now **fails** on a stale projection with a `Run \`crumb reindex\``
+hint — the trust primitive no longer certifies drift.
 
 ### `crumb search`
 
@@ -364,8 +396,9 @@ cannot execute the CLI can still reorient by reading:
 Everything is human-readable Markdown, so no binary store or vendor runtime is
 required to resume. (`generated/resume-packet.md` is a rebuildable projection — if
 it disagrees with the canonical records, the records win and it should be
-regenerated; `audit` flags this drift by comparing the packet's stamped
-`inputs_hash` against the canonical inputs.)
+regenerated; both `validate` and `audit` flag this drift by comparing the packet's
+stamped `inputs_hash` against the canonical inputs, and mutations reindex it
+automatically so it stays in step.)
 
 ---
 
@@ -376,6 +409,8 @@ regenerated; `audit` flags this drift by comparing the packet's stamped
 | `init` | implemented (Phase 1) |
 | `validate` | implemented (Phase 2) |
 | `remember decision` / `remember attempt` | implemented (Phase 3) |
+| `verify` (verification result: outcome + method + evidence) | implemented |
+| `reindex` (rebuild generated projections) | implemented |
 | `capture session` (incl. `--fast`) | implemented (Phase 3) |
 | `resume` (incl. `--fast`, computed staleness) | implemented (Phase 4 — **MVP-core**) |
 | `search` (deterministic keyword/tag/file) | implemented (Phase 5) |
@@ -385,7 +420,7 @@ regenerated; `audit` flags this drift by comparing the packet's stamped
 | `schema` (record contract introspection + template) | implemented |
 | `note question` / `note trap` / `note idea` (write-surface) | implemented |
 | `pipx`/`pip` packaging (`crumb` console script, bundled templates) | implemented (Phase 7) |
-| MCP server (`breadcrumbs-mcp`: 8 resources, 6 prompts, 8 tools) | implemented (Phase 8 — **optional**) |
+| MCP server (`breadcrumbs-mcp`: 8 resources, 6 prompts, 10 tools) | implemented (Phase 8 — **optional**) |
 | Integrations: `init` bootstrapper, `doctor`, `mcp`, `hook` (adapter + `.mcp.json` + hooks) | implemented |
 
 With Phase 6 the full MVP (capture → resume → trust) is complete and CI-guarded;
