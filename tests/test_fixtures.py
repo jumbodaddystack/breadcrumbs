@@ -43,6 +43,11 @@ ALL_FIXTURES = [
 # fixture-06 is the one fixture whose audit is expected to BLOCK (a committed secret).
 AUDIT_SHOULD_FAIL = {"fixture-06-secret-leak"}
 
+# fixture-08 ships a deliberately stale generated projection. The projection-
+# freshness check (review F3) makes `validate` flag it, so it is excluded from the
+# "validates clean" set and pinned by its own freshness test below.
+VALIDATE_SHOULD_FLAG_FRESHNESS = {"fixture-08-packet-stale"}
+
 
 def run(argv: list[str]) -> tuple[int, str]:
     buf = io.StringIO()
@@ -61,9 +66,21 @@ def mem_of(name: str) -> Path:
 class ValidateAllTests(unittest.TestCase):
     def test_all_fixtures_validate_clean(self):
         for name in ALL_FIXTURES:
+            if name in VALIDATE_SHOULD_FLAG_FRESHNESS:
+                continue
             with self.subTest(fixture=name):
                 fails = [f for f in crumb.run_validate(mem_of(name)) if f["status"] == "fail"]
                 self.assertEqual(fails, [], f"{name}: {fails}")
+
+    def test_stale_projection_fails_validate_freshness(self):
+        # review F3: validate must not stay green while a projection is stale.
+        for name in VALIDATE_SHOULD_FLAG_FRESHNESS:
+            with self.subTest(fixture=name):
+                fails = [f for f in crumb.run_validate(mem_of(name)) if f["status"] == "fail"]
+                self.assertTrue(
+                    any(f["check"] == "freshness" for f in fails),
+                    f"{name}: expected a freshness fail, got {fails}",
+                )
 
 
 # --------------------------------------------------------------------------- #

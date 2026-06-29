@@ -187,7 +187,7 @@ def build_server():  # -> FastMCP
     def audit_project_memory() -> str:
         return mcp_core.prompt_audit_project_memory(_root())
 
-    # ---------------- Tools (7) — wrap existing functions ------------------ #
+    # ---------------- Tools (10) — wrap existing functions ----------------- #
 
     @mcp.tool()
     def memory_search(
@@ -235,6 +235,34 @@ def build_server():  # -> FastMCP
     def memory_mark_status(id: str, status: str, reason: str) -> dict:
         """Change a record's status, validate-gated (wraps `set_record_status`)."""
         return mcp_core.tool_mark_status(id, status, reason, root=_root())
+
+    @mcp.tool()
+    def memory_verify(
+        subject: str,
+        status: str,
+        method: str | None = None,
+        note: str | None = None,
+        evidence: list[EvidenceItem] | None = None,
+        tags: list[str] | None = None,
+        confidence: str | None = None,
+    ) -> dict:
+        """Record a verification result — a finding about reality (wraps `crumb verify`).
+
+        For the most common agentic output ("I checked X; here is its state"), which
+        otherwise gets mis-filed as a decision/attempt. `status` is the outcome
+        (fixed|open|regressed|not_applicable|inconclusive); `method` is
+        static|runtime|test. Populates the resume packet's verifications and is
+        searchable via `type:verification` (with `status:` filtering on the outcome).
+        """
+        return mcp_core.tool_verify(
+            subject, status, method=method, note=note, evidence=evidence,
+            tags=tags, confidence=confidence, root=_root(),
+        )
+
+    @mcp.tool()
+    def memory_reindex() -> dict:
+        """Rebuild the generated/ projections from the canonical records (wraps `crumb reindex`)."""
+        return mcp_core.tool_reindex(root=_root())
 
     @mcp.tool()
     def memory_scan_secrets() -> dict:

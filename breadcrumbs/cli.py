@@ -51,7 +51,7 @@ TEMPLATE_DIR = Path(__file__).resolve().parent / "templates" / "project-memory"
 # Dev/source-checkout fallback version. The installed distribution's version is
 # authoritative (read from package metadata in get_version); keep this in sync
 # with `version` in pyproject.toml for source-tree runs where no metadata exists.
-_FALLBACK_VERSION = "0.1.3"
+_FALLBACK_VERSION = "0.1.4"
 
 # Non-git fallback sentinels (build plan §22 Q5, resolved this phase).
 # Used everywhere git-derived fields cannot be populated.
@@ -82,6 +82,7 @@ DIR_TYPES = {
     "attempts": "attempt",
     "sessions": "session",
     "ideas": "idea",
+    "verifications": "verification",
 }
 
 # Record type -> id prefix (plan §7 "Record identity").
@@ -92,7 +93,21 @@ TYPE_PREFIX = {
     "session": "ses",
     "trap": "trap",
     "question": "q",
+    "verification": "ver",
 }
+
+# Verification outcome vocabulary (review F1). The record-level `status` stays the
+# lifecycle value (active/superseded/…); the *finding about reality* lives in the
+# `outcome` frontmatter field so it never collides with the lifecycle status.
+VALID_VERIFICATION_OUTCOME = (
+    "fixed",
+    "open",
+    "regressed",
+    "not_applicable",
+    "inconclusive",
+)
+# Verification method vocabulary (how the subject was checked).
+VALID_VERIFICATION_METHOD = ("static", "runtime", "test")
 
 # Singleton core files that must exist (plan §16.2).
 CORE_FILES = ("current.md", "handoff.md", "open-questions.md", "known-traps.md")
@@ -965,8 +980,8 @@ def run_validate(memory_dir: Path) -> list[dict]:
                 )
             )
 
-        # 16.9 — decisions/attempts need evidence OR confidence: low.
-        if rec.rtype in ("decision", "attempt"):
+        # 16.9 — decisions/attempts/verifications need evidence OR confidence: low.
+        if rec.rtype in ("decision", "attempt", "verification"):
             evidence = rec.meta.get("evidence")
             has_evidence = bool(evidence) if evidence is not None else False
             if not has_evidence and rec.meta.get("confidence") != "low":
@@ -976,6 +991,33 @@ def run_validate(memory_dir: Path) -> list[dict]:
                         "fail",
                         rel,
                         f"{rec.rtype} has no evidence and confidence is not 'low'",
+                    )
+                )
+
+        # 16.9b — verifications carry a subject and a valid outcome (review F1).
+        if rec.rtype == "verification":
+            if not (rec.meta.get("subject") or "").strip():
+                findings.append(
+                    _finding("verification", "fail", rel, "verification has no subject")
+                )
+            outcome = rec.meta.get("outcome")
+            if outcome not in VALID_VERIFICATION_OUTCOME:
+                findings.append(
+                    _finding(
+                        "verification",
+                        "fail",
+                        rel,
+                        f"invalid outcome {outcome!r} (allowed: {', '.join(VALID_VERIFICATION_OUTCOME)})",
+                    )
+                )
+            method = rec.meta.get("method")
+            if method not in (None, "") and method not in VALID_VERIFICATION_METHOD:
+                findings.append(
+                    _finding(
+                        "verification",
+                        "fail",
+                        rel,
+                        f"invalid method {method!r} (allowed: {', '.join(VALID_VERIFICATION_METHOD)})",
                     )
                 )
 
@@ -1019,6 +1061,22 @@ def run_validate(memory_dir: Path) -> list[dict]:
                 findings.append(
                     _finding("generated", "fail", rel, f"generated file lacks the '{GENERATED_MARKER}' marker")
                 )
+
+    # 16.12b — projection freshness (review F3): a generated projection stamped
+    # with an inputs_hash that no longer matches the live canonical records is
+    # stale. `validate` is the trust primitive, so it must not stay green while a
+    # projection silently desyncs — that would *certify* drift. Unstamped/older
+    # projections carry no hash and are skipped (handled by detect_packet_drift).
+    for d in detect_packet_drift(memory_dir):
+        findings.append(
+            _finding(
+                "freshness",
+                "fail",
+                d["path"],
+                f"stale projection (built from inputs_hash {d['stamped']}; "
+                f"live is {d['current']}). Run `crumb reindex`.",
+            )
+        )
 
     # 16.13 — adapter files are not loaded as canonical records. By construction the
     # loader walks only decisions/attempts/sessions/ideas, so project-root adapter
@@ -1135,6 +1193,16 @@ BODY_SECTIONS = {
         "Sketch",
         "Open Questions",
     ],
+    # Verifications record a finding about reality — "I checked X; here is its
+    # state" (review F1). subject/outcome/method live in frontmatter (so search
+    # and the resume packet can filter on them); the body carries the narrative.
+    "verification": [
+        "Subject",
+        "Outcome",
+        "Method",
+        "Evidence",
+        "Notes",
+    ],
 }
 
 # Named flags for the fixed attempt section vocabulary (review §6.2/§8): expose the
@@ -1172,6 +1240,9 @@ FRONTMATTER_ORDER = [
     "supersedes",
     "superseded_by",
     "expires_at",
+    "subject",
+    "outcome",
+    "method",
     "tags",
     "evidence",
 ]
@@ -1314,12 +1385,15 @@ def write_record(
     scope: str | None = None,
     status: str | None = None,
     agent: str = "human",
+    extra: dict | None = None,
 ) -> tuple[Path, dict]:
     """Assemble + write a durable record; return (path, frontmatter dict).
 
     Frontmatter is auto-derived (§7) + defaulted + the caller's prompted fields.
     `updated_at == created_at`. Identity is recomputed from the final filename so
-    id/slug/filename always agree.
+    id/slug/filename always agree. `extra` carries type-specific frontmatter keys
+    (e.g. a verification's subject/outcome/method, review F1) — rendered in
+    canonical order when known to FRONTMATTER_ORDER, else appended.
     """
     derived = derive_fields(project_root, agent=agent)
     defaults = default_fields()
@@ -1358,6 +1432,9 @@ def write_record(
         "tags": tags or [],
         "evidence": evidence or [],
     }
+    for k, v in (extra or {}).items():
+        if v is not None:
+            meta[k] = v
     text = render_frontmatter(meta) + "\n\n" + render_body(rtype, sections)
     path.write_text(text, encoding="utf-8")
     return path, meta
@@ -1432,6 +1509,9 @@ def set_record_status(
             "error": "status change rejected by validate: "
             + "; ".join(f["message"] for f in fails),
         }
+    # Reindex-on-write (review F2): a status flip can drop a record from / add it
+    # back to the active set, so the projections must follow.
+    reindex_projections(memory_dir)
     return {"ok": True, "id": rid, "path": str(rec.path), "from": prev, "to": status}
 
 
@@ -1553,6 +1633,9 @@ def cmd_remember(args: argparse.Namespace) -> int:
         _emit_error(args, "new record failed validation: " + "; ".join(f["message"] for f in fails))
         return 1
 
+    # Reindex-on-write (review F2): keep generated/ in step with the new record.
+    reindex_projections(memory_dir, root)
+
     summary = {
         "created": str(path),
         "id": meta["id"],
@@ -1590,18 +1673,29 @@ def record_schema() -> dict:
             "privacy": list(VALID_PRIVACY),
             "confidence": ["low", "medium", "high"],
             "session_tracking": list(VALID_SESSION_TRACKING),
+            "verification_outcome": list(VALID_VERIFICATION_OUTCOME),
+            "verification_method": list(VALID_VERIFICATION_METHOD),
         },
         "rules": {
             "evidence_or_low_confidence": (
-                "A decision or attempt needs at least one --evidence TYPE REF, or "
-                "--confidence low (validate §16.9)."
+                "A decision, attempt, or verification needs at least one --evidence "
+                "TYPE REF, or --confidence low (validate §16.9)."
             ),
         },
     }
 
 
 def _record_template(rtype: str) -> str:
-    """A copy-pasteable `crumb remember` command skeleton for a record type."""
+    """A copy-pasteable command skeleton for a record type."""
+    if rtype == "verification":
+        # Verifications are written with `crumb verify`, not `crumb remember`.
+        return "\n".join([
+            "crumb verify 'WHAT WAS CHECKED (finding id / file / claim)' \\",
+            "  --status fixed   # fixed|open|regressed|not_applicable|inconclusive \\",
+            "  --method static  # static|runtime|test \\",
+            "  --evidence file path/to/file.py:LINE \\",
+            "  --note 'what the evidence shows'",
+        ])
     lines = [f"crumb remember {rtype} \\", "  --title 'SHORT IMPERATIVE TITLE' \\"]
     flag_for = {h: a for a, h in ATTEMPT_FLAG_SECTIONS}
     for heading in BODY_SECTIONS[rtype]:
@@ -1707,11 +1801,21 @@ def _trap_block(summary: str, *, slug=None, area=None, symptom=None, why=None,
     return "\n".join(lines)
 
 
-def _refresh_resume_packet(memory_dir: Path, project_root: Path) -> None:
-    """Rewrite generated/resume-packet.md so a note/edit doesn't leave it stale (§6.6).
+def reindex_projections(memory_dir: Path, project_root: Path | None = None) -> bool:
+    """Rebuild the generated/ projections from the canonical records (review F2).
 
-    Best-effort: a refresh failure must never fail the note write itself.
+    Called after every canonical mutation (remember/note/verify/mark-status, and
+    their MCP equivalents) so the static projections never silently desync from
+    the records — the drift the review caught on the MCP write path. The live
+    resume packet always recomputes; this keeps the *file* a consumer might trust
+    (the committed snapshot, a human reading generated/) in step with it.
+
+    Best-effort by default: a refresh failure must never fail the write that
+    triggered it. `project_root` defaults to the store's parent (memory lives at
+    <root>/.project-memory). Returns True iff a projection was written.
     """
+    memory_dir = Path(memory_dir)
+    project_root = Path(project_root) if project_root is not None else memory_dir.parent
     try:
         packet = build_resume_packet(memory_dir, project_root, stale_days=STALE_AGE_DAYS)
         gen = memory_dir / "generated"
@@ -1719,8 +1823,13 @@ def _refresh_resume_packet(memory_dir: Path, project_root: Path) -> None:
         (gen / "resume-packet.md").write_text(
             render_packet_markdown(packet), encoding="utf-8"
         )
+        return True
     except Exception:  # pragma: no cover - defensive; never block a write on a projection
-        pass
+        return False
+
+
+# Back-compat alias: the note() writer and tests referenced the original name.
+_refresh_resume_packet = reindex_projections
 
 
 def note(
@@ -1838,6 +1947,134 @@ def cmd_note(args: argparse.Namespace) -> int:
     else:
         print(f"Noted {kind}: {result.get('id') or result.get('ref')}")
         print(f"  file: {result['path']}")
+    return 0
+
+
+# ---- verify (review F1) ---------------------------------------------------- #
+
+def verify(
+    memory_dir: Path,
+    project_root: Path,
+    subject: str,
+    *,
+    status: str,
+    method: str | None = None,
+    note: str | None = None,
+    evidence: list[dict] | None = None,
+    tags: list[str] | None = None,
+    confidence: str | None = None,
+    agent: str = "human",
+) -> dict:
+    """Record a verification result — a finding about reality (review F1).
+
+    The single most common agentic output ("I checked X; here is its state") had
+    no home: it was mis-filed as a decision/attempt, polluting those categories.
+    A verification is a first-class durable record whose `outcome` (fixed/open/
+    regressed/not_applicable/inconclusive) and `subject`/`method` live in
+    frontmatter so `search` and the resume packet can filter on them. It goes
+    through the same write_record + validate gate as everything else; an invalid
+    write is reverted.
+    """
+    subject = (subject or "").strip()
+    if not subject:
+        return {"ok": False, "error": "verification subject must not be empty"}
+    if status not in VALID_VERIFICATION_OUTCOME:
+        return {
+            "ok": False,
+            "error": f"invalid status {status!r}; valid: {', '.join(VALID_VERIFICATION_OUTCOME)}",
+        }
+    if method is not None and method not in VALID_VERIFICATION_METHOD:
+        return {
+            "ok": False,
+            "error": f"invalid method {method!r}; valid: {', '.join(VALID_VERIFICATION_METHOD)}",
+        }
+
+    evidence = evidence or []
+    # Evidence-or-low-confidence rule (validate §16.9) — a claim about reality with
+    # no evidence is not high-confidence. Forced to low rather than failing.
+    if not evidence and confidence != "low":
+        confidence = "low"
+
+    sections = {"Subject": subject, "Outcome": status}
+    if method:
+        sections["Method"] = method
+    if note:
+        sections["Notes"] = note
+
+    try:
+        path, meta = write_record(
+            memory_dir,
+            project_root,
+            "verification",
+            f"{subject} — {status}",
+            sections,
+            tags=tags,
+            evidence=evidence,
+            confidence=confidence,
+            agent=agent,
+            extra={"subject": subject, "outcome": status, "method": method},
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    fails = _validate_new_file(memory_dir, path)
+    if fails:
+        path.unlink()  # revert
+        return {
+            "ok": False,
+            "error": "verification rejected by validate: "
+            + "; ".join(f["message"] for f in fails),
+        }
+
+    reindex_projections(memory_dir, project_root)
+    return {
+        "ok": True,
+        "id": meta["id"],
+        "subject": subject,
+        "outcome": status,
+        "method": method,
+        "confidence": meta["confidence"],
+        "path": str(path),
+    }
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    root = resolve_root(args.project)
+    memory_dir = root / MEMORY_DIRNAME
+    if not memory_dir.is_dir():
+        _emit_error(args, f"no {MEMORY_DIRNAME}/ found at {root}. Run `crumb init` first.")
+        return 2
+
+    subject = args.subject
+    if subject is None:
+        if not _interactive():
+            _emit_error(args, "non-interactive: SUBJECT is required")
+            return 2
+        subject = input("Subject (finding id / file / claim checked): ").strip()
+
+    result = verify(
+        memory_dir,
+        root,
+        subject or "",
+        status=args.status,
+        method=args.method,
+        note=args.note,
+        evidence=_parse_evidence_pairs(args.evidence),
+        tags=_split_tags(args.tags),
+        confidence=args.confidence,
+        agent=getattr(args, "agent", "human"),
+    )
+    if not result.get("ok"):
+        _emit_error(args, result.get("error", "verify failed"))
+        return 1
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"Verified {result['subject']}: {result['outcome']}")
+        print(f"  file: {result['path']}")
+        if result["confidence"] == "low":
+            print("  note: no evidence; confidence set to low.")
     return 0
 
 
@@ -2155,6 +2392,7 @@ SECTION_CAPS = {
     "open_questions": 12,
     "likely_files": 20,
     "verification": 12,
+    "verifications": 12,
 }
 
 # Order in which sections give up items when the packet is over budget
@@ -2164,6 +2402,7 @@ TRIM_ORDER = [
     "verification",
     "likely_files",
     "open_questions",
+    "verifications",
     "known_traps",
     "failed_attempts",
     "active_decisions",
@@ -2482,9 +2721,20 @@ def _inputs_hash(memory_dir: Path) -> str:
 
 
 def build_resume_packet(
-    memory_dir: Path, root: Path, *, stale_days: int = STALE_AGE_DAYS, fast: bool = False
+    memory_dir: Path,
+    root: Path,
+    *,
+    stale_days: int = STALE_AGE_DAYS,
+    fast: bool = False,
+    task: str | None = None,
 ) -> dict:
-    """Assemble the structured resume packet (the source of both MD and JSON output)."""
+    """Assemble the structured resume packet (the source of both MD and JSON output).
+
+    When `task` is given (the "resume for THIS task" path, review F4/F6) the packet
+    is scoped to it: `requested_task` is echoed and `likely_files` is derived from
+    the records that actually match the task instead of the store-global default
+    that misdirects on off-domain work. With no task, behavior is unchanged.
+    """
     memory_dir = Path(memory_dir)
     manifest = load_manifest(memory_dir) or {}
 
@@ -2503,6 +2753,7 @@ def build_resume_packet(
     attempts = active_attempts(memory_dir)
     traps = load_traps(memory_dir)
     questions = load_open_questions(memory_dir)
+    verifications = active_verifications(memory_dir)
 
     # Project snapshot (git is the live source; handoff metadata is advisory).
     dirty = git_dirty_files(root)
@@ -2556,6 +2807,15 @@ def build_resume_packet(
         "open_questions": [q["question"] for q in questions if (q.get("status") or "open") == "open"],
         "likely_files": [],
         "verification": [],
+        "verifications": [
+            {
+                "id": r.meta.get("id", r.stem),
+                "subject": (r.meta.get("subject") or r.meta.get("title", "")),
+                "outcome": (r.meta.get("outcome") or "open"),
+                "method": r.meta.get("method"),
+            }
+            for r in verifications
+        ],
         "warnings": compute_staleness(root, handoff_meta, decisions, attempts, questions, stale_days),
         "omitted": {},
         "omitted_reason": {},
@@ -2567,14 +2827,61 @@ def build_resume_packet(
         files.extend(_evidence_refs(r, ("file", "path")))
     packet["likely_files"] = _dedup(files)
 
-    # Verification: handoff section + command-type evidence refs.
-    verify = _section_lines(handoff_sections, "Verification Commands")
+    # Verification commands: handoff section + command-type evidence refs. (Distinct
+    # from `verifications`, which are recorded *results*; this list is *how to check*.)
+    verify_cmds = _section_lines(handoff_sections, "Verification Commands")
     for r in decisions + attempts:
-        verify.extend(_evidence_refs(r, ("command", "test")))
-    packet["verification"] = _dedup(verify)
+        verify_cmds.extend(_evidence_refs(r, ("command", "test")))
+    packet["verification"] = _dedup(verify_cmds)
+
+    # Task scoping (review F4/F6): when a task is named, replace the store-global
+    # likely_files with files drawn from the records that actually match the task,
+    # and label an empty result so the consumer knows the store is cold here rather
+    # than trusting noise.
+    if task:
+        packet["requested_task"] = task
+        scoped, note = _task_scoped_files(memory_dir, root, task, stale_days=stale_days)
+        packet["likely_files"] = scoped
+        if note:
+            packet["likely_files_note"] = note
 
     _bound_packet(packet, fast=fast)
     return packet
+
+
+def active_verifications(memory_dir: Path) -> list[Record]:
+    """Active verification records, actionable outcome first (review F1).
+
+    open/regressed/inconclusive (still need attention) sort ahead of
+    not_applicable/fixed (resolved), each group newest-first via active_records.
+    """
+    order = {o: i for i, o in enumerate(
+        ("open", "regressed", "inconclusive", "not_applicable", "fixed")
+    )}
+    recs = active_records(memory_dir, "verification")
+    return sorted(recs, key=lambda r: order.get(r.meta.get("outcome") or "open", 99))
+
+
+def _task_scoped_files(
+    memory_dir: Path, root: Path, task: str, *, stale_days: int
+) -> tuple[list[str], str | None]:
+    """Files relevant to `task`, from records that match it (review F4).
+
+    Reuses the deterministic `search` scoring rather than inventing a second
+    relevance notion. Returns (files, note); note is set only when nothing matched.
+    """
+    matches, by_id = search(memory_dir, root, task, stale_days=stale_days)
+    files: list[str] = []
+    for m in matches:
+        files.extend(m.get("matched_files") or [])
+        item = by_id.get(m["id"]) or {}
+        rec = item.get("record")
+        if rec is not None:
+            files.extend(_evidence_refs(rec, ("file", "path")))
+    files = _dedup([f for f in files if f])
+    if not files:
+        return [], "no records match this task domain; starting cold"
+    return files, None
 
 
 def _dedup(items: list[str]) -> list[str]:
@@ -2588,7 +2895,7 @@ def _dedup(items: list[str]) -> list[str]:
 
 
 # Sections dropped wholesale by --fast (reduced reorientation view, §12).
-_FAST_DROP = ("active_decisions", "failed_attempts", "known_traps", "open_questions", "likely_files", "verification")
+_FAST_DROP = ("active_decisions", "failed_attempts", "known_traps", "open_questions", "likely_files", "verification", "verifications")
 
 
 def _bound_packet(packet: dict, *, fast: bool) -> None:
@@ -2647,6 +2954,16 @@ def render_packet_markdown(packet: dict) -> str:
         "",
         "# Resume Packet",
         "",
+    ]
+    if packet.get("requested_task"):
+        out += [
+            "## Requested Task",
+            packet["requested_task"],
+            "_(this is the task you asked to resume; the focus/next-action below are "
+            "where the last session left off)_",
+            "",
+        ]
+    out += [
         "## Project",
         f"**{proj['name']}** — `{proj['path']}`  ",
         f"branch `{proj['branch']}` · commit `{proj['commit']}` · {proj['dirty_state']}",
@@ -2700,9 +3017,21 @@ def render_packet_markdown(packet: dict) -> str:
         out += ["## Likely Relevant Files"]
         if packet["likely_files"]:
             out += [f"- {f}" for f in packet["likely_files"]]
+        elif packet.get("likely_files_note"):
+            out.append(f"_({packet['likely_files_note']})_")
         else:
             out.append("_(none recorded)_")
         out += _omitted_note(packet, "likely_files")
+        out.append("")
+
+        out += ["## Verifications"]
+        if packet.get("verifications"):
+            for v in packet["verifications"]:
+                method = f" · {v['method']}" if v.get("method") else ""
+                out.append(f"- `{v['id']}` — {v['subject']}: **{v['outcome']}**{method}")
+        else:
+            out.append("_(none recorded)_")
+        out += _omitted_note(packet, "verifications")
         out.append("")
 
         out += ["## Verification Commands"]
@@ -2731,13 +3060,18 @@ def cmd_resume(args: argparse.Namespace) -> int:
         return 2
 
     stale_days = args.stale_days if args.stale_days is not None else STALE_AGE_DAYS
-    packet = build_resume_packet(memory_dir, root, stale_days=stale_days, fast=args.fast)
+    task = getattr(args, "task", None)
+    packet = build_resume_packet(
+        memory_dir, root, stale_days=stale_days, fast=args.fast, task=task
+    )
     md = render_packet_markdown(packet)
     packet["approx_tokens"] = approx_tokens(md)
 
     # The full packet is the committed cloud-fallback artifact; --fast is a
     # print-only quick view and must not overwrite that artifact with a reduced one.
-    if not args.fast:
+    # A task-scoped packet is a focused, ephemeral view, so it likewise does not
+    # overwrite the canonical store-global snapshot.
+    if not args.fast and not task:
         gen = memory_dir / "generated"
         gen.mkdir(parents=True, exist_ok=True)
         (gen / "resume-packet.md").write_text(md, encoding="utf-8")
@@ -2747,6 +3081,30 @@ def cmd_resume(args: argparse.Namespace) -> int:
     else:
         print(md)
     return 0
+
+
+def cmd_reindex(args: argparse.Namespace) -> int:
+    """Rebuild the generated/ projections from the canonical records (review F2).
+
+    Mutations reindex automatically; this is the explicit refresh for after a batch
+    of `--no-reindex` writes or a hand-edit, and the actionable target `validate`
+    points at when it detects a stale projection (review F3).
+    """
+    root = resolve_root(args.project)
+    memory_dir = root / MEMORY_DIRNAME
+    if not memory_dir.is_dir():
+        _emit_error(args, f"no {MEMORY_DIRNAME}/ found at {root}. Run `crumb init` first.")
+        return 2
+
+    ok = reindex_projections(memory_dir, root)
+    summary = {"reindexed": ok, "path": str(memory_dir / "generated" / "resume-packet.md")}
+    if args.json:
+        print(json.dumps(summary, indent=2))
+    elif ok:
+        print(f"Reindexed projections: {summary['path']}")
+    else:
+        print("Reindex failed (projections left unchanged).")
+    return 0 if ok else 1
 
 
 # --------------------------------------------------------------------------- #
@@ -2947,10 +3305,18 @@ def _item_from_record(rec: Record) -> dict:
     text = " ".join(
         [str(rec.meta.get("title") or ""), rec.body, " ".join(tags)]
     )
+    # For verifications the interesting "status" is the *outcome* (open/fixed/…),
+    # not the lifecycle status — so `search type:verification status:open` filters
+    # on what the agent actually cares about (review F1).
+    status = (
+        (rec.meta.get("outcome") or "open")
+        if rec.rtype == "verification"
+        else (rec.meta.get("status") or "active")
+    )
     return {
         "id": rec.meta.get("id", rec.stem),
         "kind": rec.rtype,
-        "status": (rec.meta.get("status") or "active"),
+        "status": status,
         "title": rec.meta.get("title", "") or rec.stem,
         "tags": tags,
         "files": files,
@@ -2997,7 +3363,7 @@ def _item_from_question(q: dict) -> dict:
 def _candidate_items(memory_dir: Path) -> list[dict]:
     """Every searchable item: durable decision/attempt records + trap + question blocks."""
     items: list[dict] = []
-    for rec in load_records(memory_dir, types=("decision", "attempt")):
+    for rec in load_records(memory_dir, types=("decision", "attempt", "verification")):
         if rec.error:
             continue
         items.append(_item_from_record(rec))
@@ -4098,9 +4464,35 @@ def cmd_mcp(args: argparse.Namespace) -> int:
             print(f"Registered MCP server '{MCP_SERVER_NAME}' in {path}")
             if not sdk:
                 print("  note: the MCP SDK isn't installed — run: pip install 'crumb-kit[mcp]'")
+            print("  note: in Claude Code a committed .mcp.json server starts "
+                  "'⏸ Pending approval' until you approve it once — this is expected.")
         return 0
 
-    _emit_error(args, "specify: `crumb mcp serve` or `crumb mcp register`")
+    if what == "doctor":
+        root = resolve_root(args.project)
+        sdk = _mcp_sdk_available()
+        mcp_path = root / ".mcp.json"
+        registered = False
+        if mcp_path.is_file():
+            try:
+                registered = MCP_SERVER_NAME in (
+                    json.loads(mcp_path.read_text(encoding="utf-8")).get("mcpServers") or {}
+                )
+            except (json.JSONDecodeError, OSError):
+                registered = False
+        report = {"sdk_available": sdk, "registered": registered, "config": str(mcp_path)}
+        if args.json:
+            print(json.dumps(report, indent=2))
+        else:
+            print("crumb mcp doctor")
+            print(f"  {'✓' if sdk else '✗'} [mcp] extra: "
+                  + ("importable" if sdk else "not installed — run: pip install 'crumb-kit[mcp]'"))
+            print(f"  {'✓' if registered else '✗'} registration: "
+                  + (f"'{MCP_SERVER_NAME}' in {mcp_path}" if registered
+                     else "not registered — run `crumb mcp register`"))
+        return 0 if (sdk and registered) else 1
+
+    _emit_error(args, "specify: `crumb mcp serve`, `crumb mcp register`, or `crumb mcp doctor`")
     return 2
 
 
@@ -4135,6 +4527,8 @@ def adapter_block() -> str:
         "  `PAUSE` / `ASK_HUMAN` verdict.",
         "- **After a durable decision or a failed approach:**",
         "  `crumb remember decision|attempt …`.",
+        "- **After checking whether something is still true / fixed:**",
+        "  `crumb verify \"<subject>\" --status fixed|open|regressed|… --evidence …`.",
         "- **Leaving a note for the next agent:** `crumb note question|trap|idea …`.",
         "- **Session end:** `crumb capture session`.",
         "",
@@ -4765,7 +5159,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_schema.add_argument(
         "schema_type", nargs="?", metavar="<type>",
-        help="limit to one record type (decision|attempt|session|idea)",
+        help="limit to one record type (decision|attempt|verification|session|idea)",
     )
     p_schema.add_argument(
         "--template", action="store_true",
@@ -4809,6 +5203,43 @@ def build_parser() -> argparse.ArgumentParser:
     pi.add_argument("--tags", help="comma-separated tags")
     pi.add_argument("--agent", default="human", help="note author label (default: human)")
     pi.set_defaults(func=cmd_note)
+
+    # verify (review F1) — record a verification result (a finding about reality)
+    p_verify = sub.add_parser(
+        "verify",
+        parents=[global_parser],
+        help="record a verification result (checked X; status fixed/open/regressed/…)",
+    )
+    p_verify.add_argument(
+        "subject", nargs="?", default=None,
+        metavar="SUBJECT",
+        help="what was checked — a finding id, file, or claim (prompted if omitted in a TTY)",
+    )
+    p_verify.add_argument(
+        "--status", required=True, choices=VALID_VERIFICATION_OUTCOME,
+        help="the verification outcome",
+    )
+    p_verify.add_argument(
+        "--method", choices=VALID_VERIFICATION_METHOD,
+        help="how it was checked (static|runtime|test)",
+    )
+    p_verify.add_argument("--note", help="free-text notes / what the evidence shows")
+    p_verify.add_argument(
+        "--evidence", nargs=2, action="append", metavar=("TYPE", "REF"),
+        help="add an evidence pointer, e.g. --evidence file path/to/file.py:170 (repeatable)",
+    )
+    p_verify.add_argument("--tags", help="comma-separated tags")
+    p_verify.add_argument("--confidence", choices=("low", "medium", "high"))
+    p_verify.add_argument("--agent", default="human", help="record author label (default: human)")
+    p_verify.set_defaults(func=cmd_verify)
+
+    # reindex (review F2) — explicit projection refresh (mutations reindex automatically)
+    p_reindex = sub.add_parser(
+        "reindex",
+        parents=[global_parser],
+        help="rebuild generated/ projections from the canonical records",
+    )
+    p_reindex.set_defaults(func=cmd_reindex)
 
     # capture session (Phase 3)
     p_capture = sub.add_parser(
@@ -4855,6 +5286,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help=f"aged-unresolved threshold in days (default: {STALE_AGE_DAYS})",
     )
+    p_resume.add_argument(
+        "--task",
+        default=None,
+        metavar="TEXT",
+        help="resume FOR this task: scope likely-files to matching records (review F4); "
+             "a task-scoped packet prints only and does not overwrite the committed snapshot",
+    )
     p_resume.set_defaults(func=cmd_resume)
 
     # search (Phase 5) — deterministic exact/keyword/tag/file lookup
@@ -4864,8 +5302,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="deterministic keyword/tag/file search over records (no embeddings)",
     )
     p_search.add_argument("query", nargs="?", default="", help="search text (optional with filters)")
-    p_search.add_argument("--type", choices=("decision", "attempt", "trap", "question"))
-    p_search.add_argument("--status", help="filter by record status (e.g. active, superseded)")
+    p_search.add_argument("--type", choices=("decision", "attempt", "verification", "trap", "question"))
+    p_search.add_argument("--status", help="filter by record status (e.g. active, superseded; "
+                                            "for verifications: the outcome, e.g. open/fixed)")
     p_search.add_argument("--tag", help="filter by tag/component")
     p_search.add_argument("--file", help="filter by file path referenced in a record")
     p_search.add_argument("--stale-days", type=int, default=None, metavar="N")
@@ -4935,6 +5374,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="add the breadcrumbs server to .mcp.json (preserves other servers)",
     )
     p_mcp_register.set_defaults(func=cmd_mcp, mcp_what="register")
+    p_mcp_doctor = mcp_sub.add_parser(
+        "doctor", parents=[global_parser],
+        help="report MCP wiring: [mcp] extra, .mcp.json registration",
+    )
+    p_mcp_doctor.set_defaults(func=cmd_mcp, mcp_what="doctor")
 
     # doctor — integration health (review §A.7)
     p_doctor = sub.add_parser(

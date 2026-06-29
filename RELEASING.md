@@ -48,15 +48,15 @@ crumb --version
 
 1. Bump `version` in `pyproject.toml` — and keep `breadcrumbs/__init__.py`
    (`__version__`) and `breadcrumbs/cli.py` (`_FALLBACK_VERSION`) in sync. Add a
-   `CHANGELOG.md` entry. (Current released version: `0.1.3`.)
-2. Tag and create a **GitHub Release** (e.g. `v0.1.3`). Publishing the release
+   `CHANGELOG.md` entry. (Current version: `0.1.4`.)
+2. Tag and create a **GitHub Release** (e.g. `v0.1.4`). Publishing the release
    triggers the `publish-pypi` job automatically. (Alternatively, *Actions →
    release → Run workflow* via `workflow_dispatch` also publishes to real PyPI.)
 
 ```bash
-git tag v0.1.3
-git push origin v0.1.3
-# then publish the release in the GitHub UI (or `gh release create v0.1.3`)
+git tag v0.1.4
+git push origin v0.1.4
+# then publish the release in the GitHub UI (or `gh release create v0.1.4`)
 ```
 
 After it runs, confirm:

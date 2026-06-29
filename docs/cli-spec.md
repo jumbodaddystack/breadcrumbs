@@ -29,18 +29,20 @@ Default output is human-readable Markdown / plain text.
 | Command | Reads | Writes | Purpose | Phase |
 |---|---|---|---|---|
 | `init` | project root | `.project-memory/`, `manifest.yml`, `.gitignore` edits | Install memory layout; record session + generated-projection policy in `manifest.yml`. | **1 (built)** |
-| `validate` | all canonical files | validation output | Enforce schema and invariants (deterministic). | 2 |
+| `validate` | all canonical files | validation output | Enforce schema and invariants (deterministic). Includes a projection-freshness check: fails on a `generated/` projection whose stamped `inputs_hash` no longer matches the live records. | 2 |
 | `remember decision` | git state, user input | decision record | Capture a durable choice. | 3 |
 | `remember attempt` | git state, user input | attempt record | Capture a tried path and its outcome. | 3 |
+| `verify <subject>` | git state, user input | verification record | Record a verification result (a finding about reality): `--status fixed\|open\|regressed\|not_applicable\|inconclusive`, `--method static\|runtime\|test`. Reindexes on write. | **built** |
+| `reindex` | all canonical files | `generated/` projections | Rebuild the generated projections from the records (mutations reindex automatically). | **built** |
 | `capture session` | git state (log, status, diff --shortstat) | session record, handoff, current | Record session end; git-prefill body sections (Files Touched is a counts-only summary). `--fast` = git-only snapshot + one-line next action. | 3 |
 | `schema [<type>]` | (none) | record contract | Print body sections / vocab / rules from source constants. `--template <type>` emits a `remember` skeleton. | **built** |
 | `note question\|trap\|idea` | user input, git state | open-questions / known-traps / idea record | Write-surface for the three kinds with no `remember` type; refreshes the resume packet. | **built** |
-| `resume` | current, handoff, records, git state | generated resume packet | Print a bounded resume packet (≤5k tokens) with computed staleness. `--fast` = git snapshot + focus + next action + staleness (print-only). | **4 (built)** |
+| `resume` | current, handoff, records, git state | generated resume packet | Print a bounded resume packet (≤5k tokens) with computed staleness. `--fast` = git snapshot + focus + next action + staleness (print-only). `--task TEXT` scopes `likely_files` to matching records (print-only). | **4 (built)** |
 | `guard "<action>"` | decisions, attempts, traps, questions, handoff | optional session note | Warn before a repeated mistake (deterministic ranking). | 5 |
 | `audit` | all memory + adapters | health report | Find stale / unsafe / bloated memory (incl. secret + instruction-like heuristics). Heuristic — does NOT gate `validate`. | **6 (built)** |
 | `scan-secrets` | committed memory | secret report | Scan committed memory for secret-like strings; non-zero on a hit. Run before committing memory. | **6 (built)** |
 | `doctor` | adapters, `.mcp.json`, hooks, packet | integration-health report | Is memory wired up? Exit 1 if a store exists but no integration is active. | **built** |
-| `mcp serve\|register` | `.mcp.json` | running server / registration | Run the MCP server, or merge its `.mcp.json` entry. | **built** |
+| `mcp serve\|register\|doctor` | `.mcp.json` | running server / registration / health | Run the MCP server, merge its `.mcp.json` entry, or report MCP wiring (`[mcp]` extra + registration). | **built** |
 | `hook session\|guard\|capture` | hook stdin payload | hook JSON on stdout | Claude Code hook translators (`init --with-hooks` installs them). | **built** |
 
 ### Integration flags on `init`

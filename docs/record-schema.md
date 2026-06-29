@@ -22,6 +22,7 @@ status/privacy vocabularies, and the body templates.
 
   decisions/      .gitkeep
   attempts/       .gitkeep
+  verifications/  .gitkeep
   sessions/       .gitkeep
   ideas/          .gitkeep
 
@@ -170,8 +171,8 @@ Identity is **filename-canonical**. The file's path is the single source of trut
   (e.g. `decisions/2026-06-25-repo-local-memory-source-of-truth.md`).
 - `slug` = the human segment of the filename (everything after the date).
 - `id` = `<type-prefix>_<YYYYMMDD>_<slug>`, with type-prefixes:
-  `dec` (decision), `att` (attempt), `idea`, `ses` (session), `trap`, `q`
-  (question).
+  `dec` (decision), `att` (attempt), `ver` (verification), `idea`, `ses`
+  (session), `trap`, `q` (question).
 
 Why filename-canonical: the filesystem cannot hold two files with the same name in
 one directory, so ID uniqueness is enforced for free and id/slug/filename cannot
@@ -260,6 +261,35 @@ degrades gracefully (age-based signals still apply).
 ## Evidence
 ## Related Records
 ```
+
+### Verification record (review F1)
+
+```markdown
+## Subject
+## Outcome
+## Method
+## Evidence
+## Notes
+```
+
+A verification records a **finding about reality** — "I checked X; here is its
+state" — the most common agentic output in maintenance/audit/review work, which
+would otherwise be mis-filed as a decision/attempt. Write it with `crumb verify
+<subject> --status <outcome> [--method <static|runtime|test>] [--evidence …]`.
+
+Three type-specific frontmatter keys carry the structured fields (so `search` and
+the resume packet can filter on them):
+
+| Key | Values | Meaning |
+|---|---|---|
+| `subject` | free text | what was checked — a finding id, file, or claim |
+| `outcome` | `fixed`, `open`, `regressed`, `not_applicable`, `inconclusive` | the verification result (distinct from the lifecycle `status`, which stays `active`) |
+| `method` | `static`, `runtime`, `test` | how it was checked |
+
+Like decisions/attempts, a verification needs at least one `--evidence TYPE REF`
+or `--confidence low` (§16.9). It appears in the resume packet's **Verifications**
+section (actionable outcomes first) and is searchable with `crumb search --type
+verification --status open` (here `--status` filters on the outcome).
 
 ### Session record
 

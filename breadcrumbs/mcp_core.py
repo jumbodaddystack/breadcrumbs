@@ -284,6 +284,9 @@ def tool_record(
             "ok": False,
             "error": "record rejected by validate: " + "; ".join(f["message"] for f in fails),
         }
+    # Reindex-on-write (review F2): an MCP write must refresh the projections too —
+    # an agent will not remember to `crumb reindex` after each `memory_record`.
+    cli.reindex_projections(mem, project_root)
     return {
         "ok": True,
         "id": meta["id"],
@@ -291,6 +294,49 @@ def tool_record(
         "path": str(path),
         "confidence": meta["confidence"],
     }
+
+
+def tool_verify(
+    subject: str,
+    status: str,
+    method: str | None = None,
+    note: str | None = None,
+    evidence: list[dict] | None = None,
+    tags: list[str] | None = None,
+    confidence: str | None = None,
+    root: str | Path | None = None,
+) -> dict:
+    """`memory_verify` — wraps `cli.verify` (review F1).
+
+    Records a verification result (a finding about reality) instead of forcing it
+    into a decision/attempt. `status` is the outcome (fixed|open|regressed|
+    not_applicable|inconclusive); `method` is static|runtime|test. Goes through the
+    same validate gate as every other write, and refreshes the projections.
+    """
+    project_root, mem = resolve(root)
+    if (missing := _memory_missing(mem)) is not None:
+        return missing
+    return cli.verify(
+        mem,
+        project_root,
+        subject,
+        status=status,
+        method=method,
+        note=note,
+        evidence=evidence,
+        tags=tags,
+        confidence=confidence,
+        agent="agent",
+    )
+
+
+def tool_reindex(root: str | Path | None = None) -> dict:
+    """`memory_reindex` — wraps `cli.reindex_projections` (review F2)."""
+    project_root, mem = resolve(root)
+    if (missing := _memory_missing(mem)) is not None:
+        return missing
+    ok = cli.reindex_projections(mem, project_root)
+    return {"ok": ok, "path": str(mem / "generated" / "resume-packet.md")}
 
 
 def tool_note(
