@@ -40,13 +40,14 @@ jobs:
       - name: Validate metadata (twine check)
         run: python -m twine check dist/*
 
-      - name: Bundled templates present in the wheel (17 files incl. 4 .gitkeep)
+      - name: Bundled templates present in the wheel (18 files incl. 5 .gitkeep)
         run: |
           WHEEL="$(ls dist/crumb_kit-*.whl)"
           n_tmpl="$(python -m zipfile -l "$WHEEL" | grep -c 'breadcrumbs/templates/project-memory/')"
           n_keep="$(python -m zipfile -l "$WHEEL" | grep -c '\.gitkeep')"
-          test "$n_tmpl" -eq 17
-          test "$n_keep" -eq 4
+          echo "template entries: $n_tmpl ; .gitkeep entries: $n_keep"
+          test "$n_tmpl" -eq 18
+          test "$n_keep" -eq 5
 
       - name: Installed-binary smoke test (mimics pipx)
         run: |
