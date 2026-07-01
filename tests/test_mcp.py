@@ -17,6 +17,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -68,9 +69,15 @@ class ResourceParityTests(unittest.TestCase):
     def test_resume_packet_matches_cli_render(self):
         name = "fixture-10-many-sessions"
         root = root_of(name)
-        packet = cli.build_resume_packet(mem_of(name), root)
-        expected = cli.render_packet_markdown(packet)
-        self.assertEqual(mcp_core.resource_resume_packet(root), expected)
+        # Pin the clock: `build_resume_packet` stamps `generated_at` via
+        # `now_iso()` at call time, and this test builds the packet twice
+        # (directly and through the MCP resource). Without a fixed clock the
+        # two builds can straddle a second boundary and disagree only on the
+        # timestamp line — a spurious failure.
+        with mock.patch.object(cli, "now_iso", return_value="2026-01-01T00:00:00+00:00"):
+            packet = cli.build_resume_packet(mem_of(name), root)
+            expected = cli.render_packet_markdown(packet)
+            self.assertEqual(mcp_core.resource_resume_packet(root), expected)
 
     def test_decisions_index_lists_active_ids(self):
         name = "fixture-01-fresh-resume"
