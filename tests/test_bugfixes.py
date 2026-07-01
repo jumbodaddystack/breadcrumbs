@@ -417,5 +417,151 @@ class CleanupBatchTests(unittest.TestCase):
         self.assertEqual(crumb._omitted_note({"omitted": {}}, "k"), [])
 
 
+# --------------------------------------------------------------------------- #
+# Group 4 — review #3 (2026-07-01) high-severity fixes R1–R5
+# --------------------------------------------------------------------------- #
+class Review3HighSeverityTests(unittest.TestCase):
+    @staticmethod
+    def _run(argv):
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = crumb.main(argv)
+        return code, buf.getvalue()
+
+    def _seeded_store(self, tmp: str) -> Path:
+        self._run(["init", "--project", tmp, "--session-tracking", "full"])
+        self._run(
+            [
+                "remember", "decision", "--project", tmp,
+                "--title", "keep sqlite", "--set", "Decision", "d",
+                "--evidence", "commit", "abc1234",
+            ]
+        )
+        return Path(tmp) / crumb.MEMORY_DIRNAME
+
+    def test_R1_capture_session_reindexes_projections(self):
+        # The session-end flow must not leave validate failing on freshness.
+        with tempfile.TemporaryDirectory() as tmp:
+            mem = self._seeded_store(tmp)
+            code, _ = self._run(
+                ["capture", "session", "--project", tmp, "--fast", "--next", "continue"]
+            )
+            self.assertEqual(code, 0)
+            fresh_fails = [
+                f
+                for f in crumb.run_validate(mem)
+                if f["check"] == "freshness" and f["status"] == "fail"
+            ]
+            self.assertEqual(fresh_fails, [])
+
+    def test_R2_init_with_flags_on_existing_store_is_integrations_only(self):
+        # Wiring integrations into an existing store must not require --force
+        # (which replaces the scaffold) and must leave every record intact.
+        with tempfile.TemporaryDirectory() as tmp:
+            mem = self._seeded_store(tmp)
+            (Path(tmp) / "CLAUDE.md").write_text("# guide\n", encoding="utf-8")
+            records_before = sorted(p.name for p in (mem / "decisions").iterdir())
+
+            code, out = self._run(["init", "--project", tmp, "--with-adapter"])
+            self.assertEqual(code, 0)
+            self.assertIn("left untouched", out)
+            self.assertEqual(
+                sorted(p.name for p in (mem / "decisions").iterdir()), records_before
+            )
+            self.assertIn(
+                "breadcrumbs managed block",
+                (Path(tmp) / "CLAUDE.md").read_text(encoding="utf-8"),
+            )
+            # Plain init (no integration flags, no --force) still refuses.
+            code, _ = self._run(["init", "--project", tmp])
+            self.assertEqual(code, 1)
+
+    def test_R3_both_quote_kinds_roundtrip(self):
+        title = '"don\'t panic" strategy'
+        text = crumb.render_frontmatter({"id": "x", "title": title}) + "\n"
+        meta, _ = crumb.parse_frontmatter(text)
+        self.assertEqual(meta["title"], title)
+
+    def test_R3_status_change_preserves_awkward_frontmatter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mem = self._seeded_store(tmp)
+            path, meta = crumb.write_record(
+                mem, Path(tmp), "decision", '"don\'t panic" strategy',
+                {"Decision": "d"}, evidence=[{"type": "commit", "ref": "abc1234"}],
+            )
+            # Hand-edited shapes the parser accepts: scalar evidence items and a
+            # list-of-maps under a generic key.
+            text = path.read_text(encoding="utf-8")
+            text = text.replace(
+                "evidence:\n  - type: commit\n    ref: abc1234",
+                "evidence:\n  - commit abc1234",
+            )
+            text = text.replace(
+                "tags: []",
+                "tags: []\nlinks:\n  - type: url\n    ref: https://example.com",
+            )
+            path.write_text(text, encoding="utf-8")
+
+            res = crumb.set_record_status(mem, meta["id"], "stale", "test", agent="t")
+            self.assertTrue(res["ok"], res)
+            rec = crumb.find_record_by_id(mem, meta["id"])
+            self.assertEqual(rec.meta["title"], '"don\'t panic" strategy')
+            self.assertEqual(rec.meta["evidence"], ["commit abc1234"])
+            self.assertEqual(
+                rec.meta["links"], [{"type": "url", "ref": "https://example.com"}]
+            )
+
+    def test_R3_unrepresentable_frontmatter_fails_closed(self):
+        with self.assertRaises(ValueError):
+            crumb.render_frontmatter({"x": [{"a": ["nested"]}]})
+
+    def test_R4_split_md_sections_is_fence_aware(self):
+        md = (
+            "# Project Handoff\n\n"
+            "## Verification Commands\n"
+            "```bash\n"
+            "pytest -x\n"
+            "# expected output:\n"
+            "## 12 passed\n"
+            "```\n\n"
+            "## Stale If\n"
+            "something\n"
+        )
+        sec = crumb.split_md_sections(md)
+        self.assertIn("## 12 passed", sec["Verification Commands"])
+        self.assertEqual(sec["Verification Commands"].count("```"), 2)
+        self.assertEqual(sec["Stale If"], "something")
+
+    def test_R4_update_handoff_keeps_fenced_content_intact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mem = self._seeded_store(tmp)
+            handoff = mem / "handoff.md"
+            base = handoff.read_text(encoding="utf-8")
+            fenced = "```bash\npytest -x\n## 12 passed\n```"
+            handoff.write_text(
+                base.replace("## Verification Commands\n", f"## Verification Commands\n{fenced}\n"),
+                encoding="utf-8",
+            )
+            crumb.update_handoff(mem, "main", "abc1234", "focus", "next thing")
+            sec = crumb.split_md_sections(handoff.read_text(encoding="utf-8"))
+            self.assertIn("## 12 passed", sec["Verification Commands"])
+            self.assertEqual(sec["Verification Commands"].count("```"), 2)
+
+    def test_R5_mcp_typeddict_supports_pre_312_pydantic(self):
+        # pydantic rejects typing.TypedDict before Python 3.12; the server must
+        # use the typing_extensions variant whenever it is available (it always
+        # is alongside the SDK, which depends on pydantic).
+        try:
+            import typing_extensions  # noqa: F401
+        except ImportError:
+            self.skipTest("typing_extensions not installed")
+        from breadcrumbs import mcp_server
+
+        self.assertEqual(mcp_server.TypedDict.__module__, "typing_extensions")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

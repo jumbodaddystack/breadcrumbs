@@ -262,7 +262,42 @@ an untested path. The highest-value additions, in order:
 
 ---
 
-## 8. Closing assessment
+## 8. Resolution status (added after the fix pass)
+
+The six High findings were resolved in the change set following this review
+(see `CHANGELOG.md` → *Unreleased*); each fix carries a regression test in
+`tests/test_bugfixes.py` (`Review3HighSeverityTests`, `test_R1_…`–`test_R5_…`):
+
+- **R1 — done.** `cmd_capture_session` now calls `reindex_projections` after
+  updating handoff/current, so the session-end flow (and the Stop hook) leaves
+  `validate` green.
+- **R2 — done.** `crumb init` with any `--with-*` flag on an existing store
+  applies just those integrations and leaves the store untouched (exit 0);
+  plain `init` still refuses, with a message that spells out `--force` deletes
+  all records instead of steering users into it. `crumb doctor`'s nudge command
+  now works as printed.
+- **R3 — done.** Single-quoted scalars support YAML `''` escaping in both the
+  renderer and parser (both-quote values round-trip); one shared list renderer
+  handles scalar and map items under any key (no more `repr` corruption or
+  scalar-evidence crash); deeper nesting raises `ValueError`; and
+  `set_record_status` re-parses its own rendering and refuses to write on any
+  mismatch (fail-closed) instead of corrupting the record.
+- **R4 — done.** `split_md_sections` tracks ``` / ~~~ fences and no longer
+  treats fenced `## ` lines as section boundaries, so capture preserves fenced
+  handoff/current content intact.
+- **R5 — done.** `mcp_server.py` prefers `typing_extensions.TypedDict`
+  (guaranteed present alongside the SDK via pydantic) with a stdlib fallback
+  for SDK-less installs, restoring the documented 3.10 floor.
+- **R6 — done.** `release.yml` routes `workflow_dispatch` to TestPyPI
+  (environment `testpypi`, `repository-url: https://test.pypi.org/legacy/`) and
+  publishes to real PyPI only on a published GitHub release — matching the
+  process RELEASING.md already documented.
+
+The Medium/Low findings (R7–R26) remain open and tracked by this document.
+
+---
+
+## 9. Closing assessment
 
 Reviews #1 and #2 asked "does it get used?" and "does the loop close?". This
 review asked "does it keep its promises under stress?" — and the answer is:

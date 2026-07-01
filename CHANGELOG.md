@@ -5,6 +5,43 @@ The format follows [Keep a Changelog](https://keepachangelog.com/), and the proj
 uses semantic versioning. The package version is independent of the on-disk record
 `schema_version` (still `1`); `crumb --version` prints both.
 
+## [Unreleased]
+
+Resolves the six high-severity findings from the third (full-system) review
+(`docs/crumb-kit-system-review-2026-07-01.md`, R1–R6).
+
+### Fixed
+- **`capture session` reindexes on write (R1)** — the session-end flow (and the
+  `Stop → crumb hook capture` hook) mutates three packet inputs (session record,
+  `handoff.md`, `current.md`) but was the one canonical mutation that never
+  refreshed the `generated/` projections, so `crumb validate` failed on
+  freshness immediately after the documented workflow.
+- **Integrations-only `init` on an existing store (R2)** — `crumb init
+  --with-adapter/--with-mcp/--with-hooks` against a project that already has a
+  store now applies just those integrations and leaves the store untouched;
+  previously it errored and steered users toward `--force`, which replaces the
+  scaffold and deletes every record. The clobber-guard message now spells out
+  that `--force` is destructive.
+- **Round-trip-safe frontmatter re-rendering (R3)** — values containing both
+  quote kinds are now emitted single-quoted with YAML `''` escaping (and parsed
+  back), block lists render both scalar and map items under *any* key (scalar
+  `evidence` items no longer crash; list-of-maps under generic keys no longer
+  persist as Python `repr` strings), unrepresentable nesting raises instead of
+  corrupting, and `set_record_status` refuses to write any rendering the parser
+  would read back differently (fail-closed round-trip check).
+- **Fence-aware markdown section splitting (R4)** — `## ` lines inside
+  ``` / ~~~ code fences are content, not section boundaries, so `capture
+  session` no longer structurally corrupts a `handoff.md`/`current.md` whose
+  sections contain fenced command output.
+- **MCP server on Python 3.10/3.11 (R5)** — tool schemas now use
+  `typing_extensions.TypedDict` (with a stdlib fallback for SDK-less installs);
+  pydantic rejects `typing.TypedDict` before Python 3.12, so `breadcrumbs-mcp`
+  crashed at startup on two of the three advertised Python versions.
+- **Release dry-run publishes to TestPyPI (R6)** — `release.yml` now routes
+  `workflow_dispatch` to TestPyPI (environment `testpypi`) and only a published
+  GitHub release to real PyPI, matching RELEASING.md; previously the documented
+  "dry-run" performed an irreversible real publish.
+
 ## [0.1.4] — 2026-06-29
 
 Resolves the high-leverage findings from the second agentic review (MCP

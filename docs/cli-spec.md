@@ -82,7 +82,10 @@ crumb init --force
 
 Behavior:
 
-- Refuses to clobber an existing `.project-memory/` unless `--force`.
+- Refuses to clobber an existing `.project-memory/` unless `--force` (which
+  replaces the scaffold and deletes all existing records). With any
+  `--with-adapter`/`--with-mcp`/`--with-hooks` flag, an existing store is left
+  untouched and just those integrations are applied (no `--force` needed).
 - Copies the bundled `breadcrumbs/templates/project-memory/` tree (shipped as
   package data, resolved package-relative) into the target's `.project-memory/`.
 - Auto-derives `project` (root dir name), `created_at` (ISO-8601 w/ tz), and sets
