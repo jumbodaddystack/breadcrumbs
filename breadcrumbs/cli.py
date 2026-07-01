@@ -351,10 +351,31 @@ def cmd_init(args: argparse.Namespace) -> int:
         return 0
 
     if memory_dir.exists() and not args.force:
+        # Integrations-only mode (review #3 R2): wiring an agent into an
+        # *existing* store must never require --force — --force replaces the
+        # scaffold and destroys every record. When any integration flag is
+        # given explicitly, apply just those and leave the store untouched.
+        integrations_requested = any(
+            getattr(args, k, None) is not None for k in ("adapter", "mcp", "hooks")
+        )
+        if integrations_requested:
+            plan = resolve_integration_plan(root, args)
+            applied = apply_integrations(root, plan)
+            if args.json:
+                print(json.dumps({"store": "existing", "integrations": applied}, indent=2))
+            else:
+                print(f"{MEMORY_DIRNAME}/ already present — store left untouched.")
+                print("Applied integrations:")
+                print(f"  adapter signpost -> {', '.join(applied['adapters']) or '(none)'}")
+                print(f"  MCP register     -> {'yes' if applied['mcp'] else 'no'}")
+                print(f"  Claude hooks     -> {', '.join(applied['hooks']) or '(none)'}")
+            return 0
         _emit_error(
             args,
             f"{MEMORY_DIRNAME}/ already exists at {root}. "
-            f"Use --force to overwrite (this replaces the template scaffold).",
+            f"To wire integrations into it, pass --with-adapter/--with-mcp/--with-hooks "
+            f"(no --force needed). --force replaces the scaffold and DELETES all "
+            f"existing records.",
         )
         return 1
 
@@ -502,11 +523,26 @@ def _parse_scalar(val: str):
     val = val.strip()
     if val == "":
         return None
-    if val[0] in "\"'":
-        # Quoted scalar: return the content up to the matching closing quote and
-        # ignore anything after it (e.g. a trailing ` # comment`). A `#` *inside*
-        # the quotes is preserved. An unterminated quote falls through to literal.
-        end = val.find(val[0], 1)
+    if val[0] == "'":
+        # Single-quoted scalar: a doubled `''` is an escaped quote (YAML), so a
+        # value containing both quote kinds round-trips (review #3 R3). Content
+        # runs to the matching close; anything after it (e.g. a ` # comment`) is
+        # ignored. An unterminated quote falls through to literal.
+        buf: list[str] = []
+        i = 1
+        while i < len(val):
+            if val[i] == "'":
+                if i + 1 < len(val) and val[i + 1] == "'":
+                    buf.append("'")
+                    i += 2
+                    continue
+                return "".join(buf)
+            buf.append(val[i])
+            i += 1
+    elif val[0] == '"':
+        # Double-quoted scalar: content up to the matching closing quote; a `#`
+        # inside the quotes is preserved, anything after the close is ignored.
+        end = val.find('"', 1)
         if end != -1:
             return val[1:end]
     val = _strip_inline_comment(val)
@@ -1286,9 +1322,42 @@ def _render_scalar(v, in_list: bool = False) -> str:
         # remainder as bogus keys. Reject it at the source instead of corrupting.
         raise ValueError("frontmatter values must be single-line (no newlines)")
     if _needs_quote(s, in_list=in_list):
-        q = "'" if '"' in s else '"'
-        return f"{q}{s}{q}"
+        if '"' in s:
+            # A double quote in the value forces the single-quoted form; interior
+            # single quotes are escaped by doubling, which _parse_scalar reverses
+            # (review #3 R3 — the old quote-flip silently truncated on re-read
+            # when a value contained both quote kinds).
+            return "'" + s.replace("'", "''") + "'"
+        return f'"{s}"'
     return s
+
+
+def _render_list_items(key: str, v: list) -> list[str]:
+    """Render a block list under `key`, supporting the shapes the parser accepts.
+
+    `_parse_list` produces scalars and one-level {key: scalar} maps for *any*
+    key, so the renderer must handle both everywhere — not just scalars on
+    generic keys and maps on `evidence` (review #3 R3: the old asymmetry
+    persisted Python `repr` strings for maps under generic keys and crashed on
+    scalars under `evidence`). Deeper nesting is not representable in this
+    frontmatter subset; fail closed rather than corrupt.
+    """
+    lines = [f"{key}:"]
+    for item in v:
+        if isinstance(item, dict):
+            if not item:
+                raise ValueError(f"frontmatter list under {key!r} contains an empty map")
+            for idx, (k2, v2) in enumerate(item.items()):
+                if isinstance(v2, (dict, list)):
+                    raise ValueError(
+                        f"frontmatter list under {key!r} nests a non-scalar value; "
+                        "not representable in this frontmatter subset"
+                    )
+                prefix = "  - " if idx == 0 else "    "
+                lines.append(f"{prefix}{k2}: {_render_scalar(v2)}")
+        else:
+            lines.append(f"  - {_render_scalar(item, in_list=True)}")
+    return lines
 
 
 def render_frontmatter(meta: dict) -> str:
@@ -1304,23 +1373,11 @@ def render_frontmatter(meta: dict) -> str:
         if key not in meta:
             continue
         v = meta[key]
-        if key == "evidence":
-            if not v:
-                lines.append("evidence: []")
-                continue
-            lines.append("evidence:")
-            for item in v:
-                items = list(item.items())
-                for idx, (k2, v2) in enumerate(items):
-                    prefix = "  - " if idx == 0 else "    "
-                    lines.append(f"{prefix}{k2}: {_render_scalar(v2)}")
-        elif isinstance(v, list):
+        if isinstance(v, list):
             if not v:
                 lines.append(f"{key}: []")
             else:
-                lines.append(f"{key}:")
-                for item in v:
-                    lines.append(f"  - {_render_scalar(item, in_list=True)}")
+                lines.extend(_render_list_items(key, v))
         else:
             lines.append(f"{key}: {_render_scalar(v)}")
     lines.append("---")
@@ -1497,7 +1554,27 @@ def set_record_status(
     meta["updated_at"] = now_iso()
     # The reason is recorded as a trailing, non-instruction comment (data, §15).
     note = f"<!-- status: {prev} -> {status} ({reason}) by {agent} at {meta['updated_at']} -->"
-    new_text = render_frontmatter(meta) + "\n" + body.rstrip("\n") + "\n\n" + note + "\n"
+    try:
+        rendered = render_frontmatter(meta)
+    except ValueError as exc:
+        return {"ok": False, "id": rid, "error": f"cannot re-render frontmatter: {exc}"}
+    # Fail-closed round-trip check (review #3 R3): the parser accepts a wider
+    # grammar than the renderer can emit, so refuse to write a rendering the
+    # parser would read back differently instead of silently corrupting the
+    # record (and having validate certify the corruption).
+    reparsed, _ = parse_frontmatter(rendered + "\n")
+    if reparsed != meta:
+        drifted = sorted(
+            k for k in set(meta) | set(reparsed) if meta.get(k) != reparsed.get(k)
+        )
+        return {
+            "ok": False,
+            "id": rid,
+            "error": "status change refused: frontmatter would not survive a "
+            f"re-render round-trip (field(s): {', '.join(drifted)}); "
+            "fix the record by hand or simplify the offending value",
+        }
+    new_text = rendered + "\n" + body.rstrip("\n") + "\n\n" + note + "\n"
     rec.path.write_text(new_text, encoding="utf-8")
 
     fails = _validate_new_file(memory_dir, rec.path)
@@ -1804,8 +1881,9 @@ def _trap_block(summary: str, *, slug=None, area=None, symptom=None, why=None,
 def reindex_projections(memory_dir: Path, project_root: Path | None = None) -> bool:
     """Rebuild the generated/ projections from the canonical records (review F2).
 
-    Called after every canonical mutation (remember/note/verify/mark-status, and
-    their MCP equivalents) so the static projections never silently desync from
+    Called after every canonical mutation (remember/note/verify/mark-status/
+    capture session, and their MCP equivalents) so the static projections never
+    silently desync from
     the records — the drift the review caught on the MCP write path. The live
     resume packet always recomputes; this keeps the *file* a consumer might trust
     (the committed snapshot, a human reading generated/) in step with it.
@@ -2221,6 +2299,11 @@ def cmd_capture_session(args: argparse.Namespace) -> int:
     recently = sections.get("Work Completed", "")
     update_handoff(memory_dir, meta["branch"], meta["commit"], focus, sections["Next Action"])
     update_current(memory_dir, focus, recently)
+    # Reindex-on-write (review #3 R1): capture mutates three packet inputs (the
+    # session record, handoff.md, current.md), so the projections must follow —
+    # otherwise the documented session-end flow leaves `validate` failing on
+    # freshness until the next resume/reindex.
+    reindex_projections(memory_dir, root)
 
     summary = {
         "session": str(path),
@@ -2262,18 +2345,37 @@ CURRENT_SECTIONS = ["Current Focus", "Recently Changed", "Watch Out For"]
 
 
 def split_md_sections(text: str) -> dict[str, str]:
-    """Split a plain-markdown file (no frontmatter) into {heading: content} on `## `."""
+    """Split a plain-markdown file (no frontmatter) into {heading: content} on `## `.
+
+    Fence-aware (review #3 R4): a `## ` line inside a ``` / ~~~ code fence is
+    content, not a section boundary — otherwise a handoff whose Verification
+    Commands section contains fenced expected output is torn apart on the next
+    capture (unterminated fence, managed headings injected inside it).
+    """
     sections: dict[str, str] = {}
     current: str | None = None
     buf: list[str] = []
+    fence: str | None = None  # the opening fence marker, e.g. "```" or "~~~~"
     for line in text.splitlines():
+        fm = re.match(r"^(`{3,}|~{3,})", line.lstrip())
+        if fence is not None:
+            # Inside a fence everything is content; only a closing fence of the
+            # same character and at least the opening length ends it.
+            if fm and fm.group(1)[0] == fence[0] and len(fm.group(1)) >= len(fence):
+                fence = None
+            if current is not None:
+                buf.append(line)
+            continue
         m = re.match(r"^##\s+(.*)$", line)
         if m:
             if current is not None:
                 sections[current] = "\n".join(buf).strip()
             current = m.group(1).strip()
             buf = []
-        elif current is not None:
+            continue
+        if fm:
+            fence = fm.group(1)
+        if current is not None:
             buf.append(line)
     if current is not None:
         sections[current] = "\n".join(buf).strip()

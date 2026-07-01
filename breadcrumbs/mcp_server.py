@@ -27,7 +27,16 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import TypedDict
+
+try:
+    # pydantic (which FastMCP uses to derive tool schemas) hard-rejects
+    # `typing.TypedDict` on Python < 3.12, so the server crashed at startup on
+    # 3.10/3.11 (review #3 R5). `typing_extensions` is always present alongside
+    # the SDK (pydantic depends on it); the stdlib fallback keeps this module
+    # importable on SDK-less installs, where the TypedDicts are annotations only.
+    from typing_extensions import TypedDict
+except ImportError:  # pragma: no cover - exercised only without the SDK/pydantic
+    from typing import TypedDict  # type: ignore[assignment]
 
 from breadcrumbs import mcp_core
 

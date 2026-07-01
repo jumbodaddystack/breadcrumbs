@@ -132,7 +132,7 @@ python crumb.py init                                   # prompt for session poli
 python crumb.py init --session-tracking distillate     # keep sessions/ local
 python crumb.py init --no-commit-generated             # keep generated/*.md local
 python crumb.py init --project /path/to/repo --json    # init elsewhere, JSON summary
-python crumb.py init --force                           # overwrite an existing scaffold
+python crumb.py init --force                           # replace an existing scaffold (DELETES all records)
 ```
 
 `init` copies the `.project-memory/` template tree into the target project,
@@ -145,6 +145,11 @@ signpost into `CLAUDE.md`/`AGENTS.md`, register the MCP server, install hooks).
 Default non-interactive `init` touches none of those and prints a one-line nudge.
 See **Integrations** below; flags: `--with-adapter`/`--with-mcp`/`--with-hooks`
 (and `--no-*`), `--print-integrations` (dry run), `--remove-integrations`.
+
+Running `init` with any integration flag against a project that **already has**
+a `.project-memory/` store applies just those integrations and leaves the store
+untouched — no `--force` needed (and none should be used: `--force` replaces the
+scaffold and deletes all existing records).
 
 ### `crumb validate`
 
@@ -284,9 +289,9 @@ packet. `--task TEXT` scopes **Likely Relevant Files** to the records that actua
 match the task (and labels an empty result `starting cold` rather than falling back
 to store-global noise); it is likewise print-only.
 
-Mutations (`remember`, `note`, `verify`, `mark-status`, and their MCP equivalents)
-**reindex on write**, so `generated/resume-packet.md` never silently desyncs from
-the records. `crumb reindex` rebuilds it explicitly (e.g. after a hand-edit), and
+Mutations (`remember`, `note`, `verify`, `capture session`, `mark-status`, and
+their MCP equivalents) **reindex on write**, so `generated/resume-packet.md`
+never silently desyncs from the records. `crumb reindex` rebuilds it explicitly (e.g. after a hand-edit), and
 `crumb validate` now **fails** on a stale projection with a `Run \`crumb reindex\``
 hint — the trust primitive no longer certifies drift.
 
