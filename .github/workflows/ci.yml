@@ -15,12 +15,18 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the documented floor (requires-python >=3.9); nothing proved it
+        # actually ran until CI exercised it (review #3 R18).
+        python-version: ["3.9", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
 
       # Standard library only — no install step, no third-party deps.
       - name: Unit tests (stdlib unittest)
@@ -50,8 +56,21 @@ jobs:
 
       - name: validate Fixtures 2-10 (every fixture is structurally well-formed)
         run: |
+          # fixture-08 ships a DELIBERATELY stale generated projection; since the
+          # 0.1.4 projection-freshness check (review F3) it must FAIL validate on
+          # exactly that finding (the test suite pins this too — this loop broke
+          # on main the day F3 landed and nobody taught it about fixture-08).
           for f in fixtures/fixture-0[2-9]-* fixtures/fixture-10-*; do
-            python crumb.py validate --project "$f"
+            name="$(basename "$f")"
+            if [ "$name" = "fixture-08-packet-stale" ]; then
+              if python crumb.py validate --project "$f" > /tmp/v8.out; then
+                echo "FAIL: validate should flag $name's stale projection"; exit 1
+              fi
+              grep -q freshness /tmp/v8.out || { echo "FAIL: expected a freshness finding"; cat /tmp/v8.out; exit 1; }
+              echo "$name: validate correctly flags the stale projection."
+            else
+              python crumb.py validate --project "$f"
+            fi
           done
 
       - name: guard fixtures behave (true positive / false-positive control)
@@ -107,6 +126,43 @@ jobs:
           print("Fixtures 7/8: audit flags instruction-like text and generated-packet drift.")
           PY
 
+  # Review #3 R5/R18: the MCP server must actually start on every Python it
+  # advertises (the SDK floor is 3.10) — pydantic's TypedDict rejection made it
+  # crash on 3.10/3.11 while CI, which never installed the [mcp] extra, stayed
+  # green. Installing the extra also un-skips the SDK registration test.
+  mcp:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install with the [mcp] extra
+        run: python -m pip install ".[mcp]"
+
+      - name: Unit tests (SDK present — the registration test must not self-skip)
+        run: python -m unittest discover -s tests -p 'test_*.py'
+
+      - name: Server builds and registers all tools + prompts
+        run: |
+          python - <<'PY'
+          import asyncio
+          from breadcrumbs import mcp_server
+          assert mcp_server.sdk_available(), "SDK not importable after [mcp] install"
+          server = mcp_server.build_server()
+          tools = asyncio.run(server.list_tools())
+          assert len(tools) == 10, [t.name for t in tools]
+          prompts = asyncio.run(server.list_prompts())
+          assert len(prompts) == 6, [p.name for p in prompts]
+          print(f"{len(tools)} tools, {len(prompts)} prompts registered.")
+          PY
+
   # Phase 7 (packaging / §18 Phase 4): the package must install from source AND
   # from a built wheel, expose the `crumb` console script, bundle the
   # templates as package data, and smoke-test every MVP command from the
@@ -125,15 +181,28 @@ jobs:
           python -m pip install --upgrade pip build
           python -m build
 
-      - name: Bundled templates present in the wheel (18 files incl. 5 .gitkeep)
+      # Identity check against the tracked source tree — no duplicated magic
+      # counts to keep in sync across workflows (review #3 R18).
+      - name: Bundled templates match the tracked source tree
         run: |
           WHEEL="$(ls dist/crumb_kit-*.whl)"
           echo "wheel: $WHEEL"
-          n_tmpl="$(python -m zipfile -l "$WHEEL" | grep -c 'breadcrumbs/templates/project-memory/')"
-          n_keep="$(python -m zipfile -l "$WHEEL" | grep -c '\.gitkeep')"
-          echo "template entries: $n_tmpl ; .gitkeep entries: $n_keep"
-          test "$n_tmpl" -eq 18
-          test "$n_keep" -eq 5
+          python - "$WHEEL" <<'PY'
+          import subprocess, sys, zipfile
+          wheel = sys.argv[1]
+          src = set(subprocess.run(
+              ["git", "ls-files", "breadcrumbs/templates/project-memory"],
+              capture_output=True, text=True, check=True,
+          ).stdout.split())
+          bundled = {n for n in zipfile.ZipFile(wheel).namelist()
+                     if n.startswith("breadcrumbs/templates/project-memory/")}
+          assert src, "no template files tracked in git?"
+          missing = src - bundled
+          extra = bundled - src
+          assert not missing, f"templates missing from wheel: {sorted(missing)}"
+          assert not extra, f"unexpected wheel template entries: {sorted(extra)}"
+          print(f"all {len(src)} tracked template files bundled, no extras.")
+          PY
 
       - name: Install the built wheel into an isolated venv (mimics pipx)
         run: |

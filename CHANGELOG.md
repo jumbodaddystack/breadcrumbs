@@ -8,7 +8,23 @@ uses semantic versioning. The package version is independent of the on-disk reco
 ## [Unreleased]
 
 Resolves the six high-severity findings from the third (full-system) review
-(`docs/crumb-kit-system-review-2026-07-01.md`, R1–R6).
+(`docs/crumb-kit-system-review-2026-07-01.md`, R1–R6), and — in a second pass —
+all twenty of its Medium/Low findings (R7–R26), completing the review.
+
+### Added
+- **`crumb mark-status <id> <status>` (R25)** — the record lifecycle mutation
+  (stale/disputed/superseded/…) as a CLI command; it previously existed only as
+  the MCP `memory_mark_status` tool despite README/docs describing the flow.
+  `--superseded-by ID` sets the pointer validate requires when superseding
+  (mirrored on the MCP tool as a new optional param) — this is the "supersede
+  flow" mcp-spec referenced.
+- **Trap-token guard pre-filter index (R9)** — reindex now also writes
+  `generated/guard-prefilter.json`, a token/path index over known traps and
+  do-not-retry attempts. The `PreToolUse` hook consults it (one small-file
+  read; still no record walk on the common path), so a trap-shaped but
+  routine-looking command (`pytest -n auto`) escalates to full guard scoring —
+  the near-miss class that motivated hooks in review #1, previously covered
+  only by a hardcoded regex.
 
 ### Fixed
 - **`capture session` reindexes on write (R1)** — the session-end flow (and the
@@ -41,6 +57,74 @@ Resolves the six high-severity findings from the third (full-system) review
   `workflow_dispatch` to TestPyPI (environment `testpypi`) and only a published
   GitHub release to real PyPI, matching RELEASING.md; previously the documented
   "dry-run" performed an irreversible real publish.
+- **Trust loop (R7, R8)** — `_inputs_hash` now covers `manifest.yml` (a packet
+  input), so the freshness check can no longer certify a packet built from a
+  since-edited manifest; the packet's `warnings` list is capped (20) with an
+  omitted-count disclosure and is budget-trimmable *after* every substantive
+  section, so the ≤5k-token bound holds even on warning-heavy stores.
+- **MCP parity (R10, R11, R12)** — `memory_build_resume_packet(task=…)` passes
+  `task` through to the engine (scoped `likely_files`, `starting cold` label —
+  identical to `crumb resume --task`) instead of merely echoing it;
+  `memory_record` returns the CLI's error for an explicit evidence-less
+  medium/high confidence instead of silently downgrading it to low (unstated
+  confidence still defaults to low); `crumb mcp serve --project PATH` actually
+  serves that project (exports `BREADCRUMBS_PROJECT`) instead of silently
+  serving cwd.
+- **Hook robustness (R13)** — a truthy non-dict `tool_input` (and a valid but
+  non-object JSON stdin payload) degrades to `{}` like every other malformed
+  payload instead of crashing with a traceback.
+- **Content preservation (R14)** — `update_handoff`/`update_current` keep user
+  intro text between the header and the first `## `, and duplicate-heading
+  bodies are merged instead of last-wins dropped (shared fence-aware ordered
+  splitter).
+- **Shallow clones (R15)** — `capture session` diffs from the shallow boundary
+  instead of the empty tree, so "Files Touched" no longer claims the entire
+  repo in a depth-limited clone.
+- **Validate robustness (R16, R17)** — a non-string verification `subject` and
+  a non-UTF-8 `handoff.md`/`generated/*.md` are reported as findings instead of
+  crashing the trust primitive; session done-markers are word-boundary matched
+  ("done" no longer matches "abandoned").
+- **CI blindness (R18)** — the test job runs a 3.9/3.11/3.12 matrix (3.9 is the
+  documented floor); a new `mcp` job installs the `[mcp]` extra on 3.10–3.12,
+  runs the suite (un-skipping the SDK registration test that would have caught
+  R5) and asserts the server builds with all 10 tools + 6 prompts; the
+  bundled-template guardrail compares the wheel against `git ls-files` identity
+  instead of duplicated magic counts. Also repairs the "validate Fixtures 2-10"
+  step, red on `main` since the 0.1.4 freshness check landed: fixture-08's
+  projection is *deliberately* stale, so that step now asserts the freshness
+  failure instead of tripping over it (the unit suite already pinned this).
+- **Signal quality (R19, R20)** — template placeholder values in the handoff
+  header are treated as absent, so a fresh store no longer warns "branch
+  mismatch … '<branch>'" / "timestamp is not parseable" on every resume/guard
+  until first capture; `audit` reports the unconditional handoff age/distance
+  line as INFO unless it is actually cold (⚠), so a seconds-old store audits
+  quietly.
+- **Record integrity (R21, R23, R24)** — git's C-quoted porcelain paths
+  (spaces/quotes/non-ASCII) are decoded before storage in `dirty_files`;
+  recency ordering parses timestamps instead of comparing strings (mixed UTC
+  offsets no longer pick the wrong "newest" record); unborn-HEAD repos record
+  the real branch name; `load_manifest` no longer truncates values at a bare
+  `#`; record/singleton/projection writes go through tmp+rename (no truncated
+  files on interruption); a status-change `reason` containing `-->` can no
+  longer escape the trailing HTML comment.
+- **Note hygiene (R22)** — question/trap text and field values are flattened to
+  one line (embedded `\n## …` can no longer forge headings) and comment markers
+  are neutralized (a `<!--`/`-->` pair across two traps could comment-join
+  everything between them out of every reader); duplicate trap slugs and
+  duplicate questions are refused instead of accumulating shadowed blocks; the
+  template-placeholder filter matches the exact template lines instead of any
+  user line shaped like `_No … yet._`.
+- **MCP envelope + docs (R25)** — every tool success now carries `ok`
+  (search/guard/packet gained it; `scan_secrets` keeps `clean` alongside);
+  the dead `fast` parameter is gone from the packet adapter;
+  `breadcrumbs-mcp --help` prints usage instead of silently starting the stdio
+  server; mcp-spec's tool table matches reality (incl. `files` on
+  `memory_search`).
+- **Heuristic coverage (R26)** — the instruction-like scan catches natural
+  phrasings ("ignore failing tests", "ignore all prior instructions", "bypass
+  the code review"); the secret scan adds `refresh_token`/`private_key`/
+  `id_token`/`session_token`/`signing_key` labels, matches JSON-quoted keys,
+  and scans `.yaml`/`.json`/`.txt` under memory, not just `.md`/`.yml`.
 
 ## [0.1.4] — 2026-06-29
 

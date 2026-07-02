@@ -293,7 +293,44 @@ The six High findings were resolved in the change set following this review
   publishes to real PyPI only on a published GitHub release — matching the
   process RELEASING.md already documented.
 
-The Medium/Low findings (R7–R26) remain open and tracked by this document.
+**Update (2026-07-02):** the Medium/Low findings (**R7–R26**) were resolved in a
+second fix pass (see `CHANGELOG.md` → *Unreleased*), each with a regression test
+in `tests/test_bugfixes.py` (`Review3MediumLowTests`, `test_R7_…`–`test_R26_…`).
+Highlights, mapped to §7's ranked recommendations:
+
+- **Trust loop closed (R7, R8):** `_inputs_hash` covers `manifest.yml`; packet
+  warnings are capped (20), disclosed when omitted, and budget-trimmable last —
+  the ≤5k bound now holds on warning-heavy stores.
+- **Hook risk derived from the store (R9, R13):** reindex emits
+  `generated/guard-prefilter.json` (trap + do-not-retry tokens/paths); the
+  PreToolUse pre-filter consults it with one small-file read, so `pytest -n
+  auto` against a recorded trap escalates to full guard (verified end-to-end);
+  the hardcoded `gradlew --stop` special case is gone, and hostile payloads
+  (non-dict `tool_input`, non-object JSON) degrade to `{}`.
+- **MCP parity (R10, R11, R12, R25):** `task=` passes through to the engine;
+  evidence-less explicit high confidence errors exactly like the CLI; `mcp
+  serve --project` exports `BREADCRUMBS_PROJECT`; every tool success carries
+  `ok`; `breadcrumbs-mcp --help` prints usage; the spec table matches reality;
+  and `crumb mark-status` (with `--superseded-by`, mirrored over MCP) closes
+  the documented-but-missing write surface.
+- **Content/record integrity (R14, R15, R16, R17, R21, R22, R23, R24):**
+  preamble + duplicate-heading preservation via a shared ordered splitter;
+  shallow-clone-bounded capture; validate reports (never crashes on) non-string
+  subjects and non-UTF-8 files; word-boundary done-markers; C-quoted git paths
+  decoded; sanitized + deduplicated notes with an anchored placeholder filter;
+  chronological (not lexicographic) recency; unborn-HEAD branch names; `#`-safe
+  manifest values; tmp+rename atomic writes; comment-escape-proof status
+  reasons.
+- **CI vision (R18):** 3.9/3.11/3.12 test matrix, an `[mcp]`-extra job on
+  3.10–3.12 that builds the server and lists tools (the job class that would
+  have caught R5), and a wheel-vs-`git ls-files` identity check replacing the
+  duplicated magic template counts.
+- **Noise (R19, R20):** placeholder-aware handoff metadata and severity-gated
+  audit staleness — a fresh or seconds-old store now resumes and audits quietly.
+- **Heuristics (R26):** natural-phrasing instruction-like patterns; more
+  credential labels (incl. JSON-quoted keys); `.yaml`/`.json`/`.txt` scanned.
+
+With this pass, every finding in this review (R1–R26) is resolved.
 
 ---
 
