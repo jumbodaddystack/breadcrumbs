@@ -142,7 +142,11 @@ class HealthViewTests(unittest.TestCase):
             )
             git(root, "checkout", "-q", "-b", "feature-x")
             findings = crumb.run_audit(mem, root)
-            self.assertIn("branch mismatch", warns_text(findings))
+            # The record was written on the original branch; HEAD is now on
+            # feature-x. (The handoff-level "branch mismatch" line no longer
+            # fires here: a fresh store's handoff carries only the template
+            # placeholder branch, which is placeholder-aware since review #3 R19.)
+            self.assertIn("written on other branches", warns_text(findings))
 
 
 # --------------------------------------------------------------------------- #

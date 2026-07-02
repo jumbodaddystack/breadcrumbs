@@ -43,14 +43,27 @@ jobs:
       - name: Validate metadata (twine check)
         run: python -m twine check dist/*
 
-      - name: Bundled templates present in the wheel (18 files incl. 5 .gitkeep)
+      # Identity check against the tracked source tree — no duplicated magic
+      # counts to keep in sync across workflows (review #3 R18).
+      - name: Bundled templates match the tracked source tree
         run: |
           WHEEL="$(ls dist/crumb_kit-*.whl)"
-          n_tmpl="$(python -m zipfile -l "$WHEEL" | grep -c 'breadcrumbs/templates/project-memory/')"
-          n_keep="$(python -m zipfile -l "$WHEEL" | grep -c '\.gitkeep')"
-          echo "template entries: $n_tmpl ; .gitkeep entries: $n_keep"
-          test "$n_tmpl" -eq 18
-          test "$n_keep" -eq 5
+          python - "$WHEEL" <<'PY'
+          import subprocess, sys, zipfile
+          wheel = sys.argv[1]
+          src = set(subprocess.run(
+              ["git", "ls-files", "breadcrumbs/templates/project-memory"],
+              capture_output=True, text=True, check=True,
+          ).stdout.split())
+          bundled = {n for n in zipfile.ZipFile(wheel).namelist()
+                     if n.startswith("breadcrumbs/templates/project-memory/")}
+          assert src, "no template files tracked in git?"
+          missing = src - bundled
+          extra = bundled - src
+          assert not missing, f"templates missing from wheel: {sorted(missing)}"
+          assert not extra, f"unexpected wheel template entries: {sorted(extra)}"
+          print(f"all {len(src)} tracked template files bundled, no extras.")
+          PY
 
       - name: Installed-binary smoke test (mimics pipx)
         run: |

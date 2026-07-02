@@ -76,16 +76,21 @@ current instruction, the code, the tests, or authoritative docs (plan §15).
 
 | Tool | Signature | Wraps | Output |
 |---|---|---|---|
-| `memory_search` | `(query, filters?)` | `cli.search` | `{query, filters, count, matches[]}` |
+| `memory_search` | `(query, filters?, files?)` | `cli.search` | `{ok, query, filters, count, matches[]}` |
 | `memory_record` | `(type, payload)` | `cli.write_record` + validate gate, reindex | `{ok, id, type, path, confidence}` or `{ok:false, error}` |
 | `memory_verify` | `(subject, status, method?, note?, evidence?, tags?, confidence?)` | `cli.verify` + validate gate, reindex | `{ok, id, subject, outcome, method, confidence, path}` or `{ok:false, error}` |
 | `memory_note` | `(kind, text, fields?, tags?)` | `cli.note` | `{ok, kind, ref|id, path}` or `{ok:false, error}` |
 | `memory_reindex` | `()` | `cli.reindex_projections` | `{ok, path}` |
-| `memory_guard_before_action` | `(action, files?)` | `cli.guard` | the full guard result (`{verdict, matches, history, staleness, next_action, …}`) |
-| `memory_build_resume_packet` | `(task?)` | `cli.build_resume_packet` | the structured packet dict (`task` scopes `likely_files` + echoes `requested_task`) |
+| `memory_guard_before_action` | `(action, files?)` | `cli.guard` | `{ok, verdict, matches, history, staleness, next_action, …}` |
+| `memory_build_resume_packet` | `(task?)` | `cli.build_resume_packet` | `{ok, …packet}` (`task` is passed to the engine: scoped `likely_files`, echoed `requested_task`, `starting cold` label — identical to `crumb resume --task`) |
 | `memory_validate` | `()` | `cli.run_validate` | `{ok, fail_count, findings[]}` (includes the projection-freshness check) |
-| `memory_mark_status` | `(id, status, reason)` | `cli.set_record_status`, reindex | `{ok, id, from, to, path}` or `{ok:false, error}` |
-| `memory_scan_secrets` | `()` | `cli.scan_secrets` | `{clean, count, findings[]}` (pattern names + locations only) |
+| `memory_mark_status` | `(id, status, reason, superseded_by?)` | `cli.set_record_status`, reindex | `{ok, id, from, to, path}` or `{ok:false, error}` |
+| `memory_scan_secrets` | `()` | `cli.scan_secrets` | `{ok, clean, count, findings[]}` (pattern names + locations only) |
+
+**Envelope.** Every tool success carries `ok`; a missing store is always
+`{ok:false, error}`. For `memory_validate` and `memory_scan_secrets`, `ok`
+additionally means "healthy/safe" (`false` when problems/findings exist);
+`clean` is kept on the scan result for compatibility.
 
 ### `memory_verify`
 
@@ -118,7 +123,8 @@ Mirrors the `remember` CLI surface:
   "sections": { "Decision": "…", "Rationale": "…" },  // {heading: text}
   "evidence": [ { "type": "commit", "ref": "abc1234" } ],
   "tags": ["storage"],
-  "confidence": "high",      // optional; forced to "low" if no evidence (validate §16.9)
+  "confidence": "high",      // optional; omitted ⇒ "low" when no evidence; explicit
+                             // medium/high without evidence is an error (validate §16.9)
   "privacy": "repo-safe",    // optional
   "scope": "repo",           // optional
   "status": "active",        // optional
@@ -135,7 +141,9 @@ half-written file) and `{ok:false, error}` is returned.
 Changes a record's `status` (e.g. `stale`, `disputed`, `rejected`) and stamps
 `updated_at`, recording `reason` as a trailing non-instruction comment. The edit
 is **validate-gated**: e.g. marking `superseded` without a `superseded_by` is
-rejected (§16.6) and reverted. Use the supersede flow for replacements.
+rejected (§16.6) and reverted. When superseding, pass `superseded_by` (the
+replacing record's id) — the same flow as `crumb mark-status <id> superseded
+--superseded-by <new-id>` on the CLI.
 
 ---
 

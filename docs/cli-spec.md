@@ -41,6 +41,7 @@ Default output is human-readable Markdown / plain text.
 | `guard "<action>"` | decisions, attempts, traps, questions, handoff | optional session note | Warn before a repeated mistake (deterministic ranking). | 5 |
 | `audit` | all memory + adapters | health report | Find stale / unsafe / bloated memory (incl. secret + instruction-like heuristics). Heuristic — does NOT gate `validate`. | **6 (built)** |
 | `scan-secrets` | committed memory | secret report | Scan committed memory for secret-like strings; non-zero on a hit. Run before committing memory. | **6 (built)** |
+| `mark-status <id> <status>` | one record | status + `updated_at` (+ optional `superseded_by`) | Record lifecycle mutation (stale/disputed/superseded/…), validate-gated and reverted on failure; `--superseded-by ID` is the supersede flow. Reindexes on write. | **built** |
 | `doctor` | adapters, `.mcp.json`, hooks, packet | integration-health report | Is memory wired up? Exit 1 if a store exists but no integration is active. | **built** |
 | `mcp serve\|register\|doctor` | `.mcp.json` | running server / registration / health | Run the MCP server, merge its `.mcp.json` entry, or report MCP wiring (`[mcp]` extra + registration). | **built** |
 | `hook session\|guard\|capture` | hook stdin payload | hook JSON on stdout | Claude Code hook translators (`init --with-hooks` installs them). | **built** |
@@ -62,8 +63,7 @@ reversible.
 ### Later commands (post-MVP)
 
 ```text
-mark-status <id> <status>
-supersede <old-id> <new-id>
+supersede <old-id> <new-id>   # sugar over `mark-status --superseded-by` (which is built)
 build-index
 dashboard | recent | where-was-i
 ```

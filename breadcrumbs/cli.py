@@ -31,6 +31,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -129,6 +130,25 @@ SESSION_DONE_MARKERS = ("converged", "session complete", "no next action", "done
 # --------------------------------------------------------------------------- #
 # Small helpers
 # --------------------------------------------------------------------------- #
+
+def write_text_atomic(path: Path, text: str) -> None:
+    """Write text via tmp-file + rename in the destination directory.
+
+    A plain `write_text` interrupted mid-write leaves a truncated record that
+    validate then reports as corrupt (review #3 R24); `os.replace` is atomic on
+    the same filesystem, so readers see either the old file or the new one.
+    """
+    path = Path(path)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
 
 def now_iso() -> str:
     """Local time, ISO-8601, timezone-aware (e.g. 2026-06-25T14:30:00-05:00)."""
@@ -796,6 +816,12 @@ def git_branch(root: Path) -> str:
     if not is_git_repo(root):
         return NO_GIT_BRANCH
     out = _git_out(root, "rev-parse", "--abbrev-ref", "HEAD")
+    if out:
+        return out
+    # An unborn HEAD (fresh repo, no commits yet) fails rev-parse but still has
+    # a real branch name — read it so records don't pair `branch: (no-git)` with
+    # populated dirty_files (review #3 R24).
+    out = _git_out(root, "symbolic-ref", "--short", "HEAD")
     return out if out else NO_GIT_BRANCH
 
 
@@ -804,6 +830,47 @@ def git_commit(root: Path) -> str:
         return NO_GIT_COMMIT
     out = _git_out(root, "rev-parse", "--short", "HEAD")
     return out if out else NO_GIT_COMMIT
+
+
+# git C-style escapes used in quoted porcelain paths (paths with spaces/quotes/
+# non-ASCII are emitted as "caf\303\251.txt"; octal escapes are raw UTF-8 bytes).
+_GIT_PATH_ESCAPES = {
+    "n": 0x0A, "t": 0x09, "r": 0x0D, '"': 0x22, "\\": 0x5C,
+    "a": 0x07, "b": 0x08, "f": 0x0C, "v": 0x0B,
+}
+
+
+def _unquote_git_path(path: str) -> str:
+    """Decode git's C-style quoted path form back to the real path (review #3 R21).
+
+    Unquoted paths pass through unchanged. Storing the quoted form verbatim
+    persisted strings like '"caf\\303\\251.txt"' into frontmatter, which could
+    then trip the R3 round-trip refusal on a later status change.
+    """
+    if not (len(path) >= 2 and path[0] == '"' and path[-1] == '"'):
+        return path
+    body = path[1:-1]
+    out = bytearray()
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch == "\\" and i + 1 < len(body):
+            nxt = body[i + 1]
+            if nxt in _GIT_PATH_ESCAPES:
+                out.append(_GIT_PATH_ESCAPES[nxt])
+                i += 2
+                continue
+            if nxt in "01234567":
+                val, j = 0, 0
+                while j < 3 and i + 1 + j < len(body) and body[i + 1 + j] in "01234567":
+                    val = val * 8 + int(body[i + 1 + j])
+                    j += 1
+                out.append(val)
+                i += 1 + j
+                continue
+        out.extend(ch.encode("utf-8"))
+        i += 1
+    return out.decode("utf-8", errors="replace")
 
 
 def git_dirty_files(root: Path) -> list[str]:
@@ -819,6 +886,7 @@ def git_dirty_files(root: Path) -> list[str]:
         if " -> " in path:
             # rename/copy entries are "R  old -> new"; record the destination.
             path = path.split(" -> ", 1)[1].strip()
+        path = _unquote_git_path(path)
         if path:
             files.append(path)
     return files
@@ -871,13 +939,18 @@ def load_manifest(memory_dir: Path) -> dict | None:
         return None
     out: dict[str, str] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.split("#", 1)[0].strip()
-        if not line or ":" not in line:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or ":" not in stripped:
             continue
-        key, _, val = line.partition(":")
+        key, _, val = stripped.partition(":")
         val = val.strip()
         if len(val) >= 2 and val[0] in "\"'" and val[-1] == val[0]:
             val = val[1:-1]  # unquote so `schema_version: "1"` compares as `1`
+        else:
+            # Strip an inline comment only at a whitespace boundary — a bare `#`
+            # inside a value (e.g. `project: my#proj`) is content, not a comment
+            # (review #3 R24).
+            val = re.split(r"\s+#", val, 1)[0].strip()
         out[key.strip()] = val
     return out
 
@@ -1032,9 +1105,15 @@ def run_validate(memory_dir: Path) -> list[dict]:
 
         # 16.9b — verifications carry a subject and a valid outcome (review F1).
         if rec.rtype == "verification":
-            if not (rec.meta.get("subject") or "").strip():
+            subj = rec.meta.get("subject")
+            # A non-string subject (e.g. a hand-edited YAML list) is a finding,
+            # not a crash (review #3 R16).
+            if not (isinstance(subj, str) and subj.strip()):
                 findings.append(
-                    _finding("verification", "fail", rel, "verification has no subject")
+                    _finding("verification", "fail", rel,
+                             "verification has no subject"
+                             if subj in (None, "")
+                             else f"verification subject must be a string, got {type(subj).__name__}")
                 )
             outcome = rec.meta.get("outcome")
             if outcome not in VALID_VERIFICATION_OUTCOME:
@@ -1061,7 +1140,12 @@ def run_validate(memory_dir: Path) -> list[dict]:
         if rec.rtype == "session":
             has_next = any(re.search(r"next action", h, re.I) for h in rec.sections)
             body_l = rec.body.lower()
-            has_done = any(mark in body_l for mark in SESSION_DONE_MARKERS)
+            # Word-boundary match (review #3 R17): a raw substring test let
+            # "done" match "abandoned", false-passing the convergence check.
+            has_done = any(
+                re.search(rf"\b{re.escape(mark)}\b", body_l)
+                for mark in SESSION_DONE_MARKERS
+            )
             if not (has_next or has_done):
                 findings.append(
                     _finding("session", "fail", rel, "session record lacks a '## Next Action' or convergence/done marker")
@@ -1070,7 +1154,15 @@ def run_validate(memory_dir: Path) -> list[dict]:
     # 16.11 — handoff has branch, commit, next action, stale conditions.
     handoff = memory_dir / "handoff.md"
     if handoff.is_file():
-        htext = handoff.read_text(encoding="utf-8")
+        try:
+            htext = handoff.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            # A finding, not a crash (review #3 R16).
+            findings.append(_finding("handoff", "fail", "handoff.md", f"unreadable file: {exc}"))
+            htext = None
+    else:
+        htext = None
+    if htext is not None:
         required = {
             "branch": re.search(r"branch\s*:", htext, re.I),
             "commit": re.search(r"commit\s*:", htext, re.I),
@@ -1090,7 +1182,12 @@ def run_validate(memory_dir: Path) -> list[dict]:
             if p.name == "README.md":
                 continue
             rel = str(p.relative_to(memory_dir))
-            head = "\n".join(p.read_text(encoding="utf-8").splitlines()[:5])
+            try:
+                head = "\n".join(p.read_text(encoding="utf-8").splitlines()[:5])
+            except (OSError, UnicodeDecodeError) as exc:
+                # A finding, not a crash (review #3 R16).
+                findings.append(_finding("generated", "fail", rel, f"unreadable file: {exc}"))
+                continue
             if GENERATED_MARKER in head:
                 findings.append(_finding("generated", "pass", rel, "carries generated-projection marker"))
             else:
@@ -1493,7 +1590,7 @@ def write_record(
         if v is not None:
             meta[k] = v
     text = render_frontmatter(meta) + "\n\n" + render_body(rtype, sections)
-    path.write_text(text, encoding="utf-8")
+    write_text_atomic(path, text)
     return path, meta
 
 
@@ -1531,13 +1628,16 @@ def set_record_status(
     reason: str,
     *,
     agent: str = "human",
+    superseded_by: str | None = None,
 ) -> dict:
     """Change a durable record's `status`, gated by `validate` (§16.6).
 
     Reuses parse/render frontmatter + the same validate gate as `remember`, so
     there is one source of write-behavior. Returns a small result dict. The edit
     is reverted if it would leave the record invalid (e.g. `superseded` without
-    `superseded_by`), and an error is returned instead.
+    `superseded_by`), and an error is returned instead. `superseded_by` points
+    a superseding record when marking `superseded` (review #3 R25 — this is the
+    supersede flow the docs reference).
     """
     memory_dir = Path(memory_dir)
     if status not in VALID_STATUS:
@@ -1552,7 +1652,12 @@ def set_record_status(
     prev = meta.get("status")
     meta["status"] = status
     meta["updated_at"] = now_iso()
+    if superseded_by:
+        meta["superseded_by"] = superseded_by
     # The reason is recorded as a trailing, non-instruction comment (data, §15).
+    # A literal `-->` inside the reason would terminate the comment early and
+    # leak the remainder as content (review #3 R24) — neutralize it.
+    reason = (reason or "").replace("-->", "-- >")
     note = f"<!-- status: {prev} -> {status} ({reason}) by {agent} at {meta['updated_at']} -->"
     try:
         rendered = render_frontmatter(meta)
@@ -1575,11 +1680,11 @@ def set_record_status(
             "fix the record by hand or simplify the offending value",
         }
     new_text = rendered + "\n" + body.rstrip("\n") + "\n\n" + note + "\n"
-    rec.path.write_text(new_text, encoding="utf-8")
+    write_text_atomic(rec.path, new_text)
 
     fails = _validate_new_file(memory_dir, rec.path)
     if fails:
-        rec.path.write_text(original, encoding="utf-8")  # revert
+        write_text_atomic(rec.path, original)  # revert
         return {
             "ok": False,
             "id": rid,
@@ -1834,6 +1939,15 @@ def cmd_schema(args: argparse.Namespace) -> int:
 NOTE_KINDS = ("question", "trap", "idea")
 
 
+# The exact placeholder lines the templates seed — anchored so a *user* line that
+# merely resembles them (e.g. "_No fix for the flaky suite yet._") is never
+# silently deleted on append (review #3 R22).
+_TEMPLATE_PLACEHOLDER_LINES = frozenset({
+    "_No open questions yet._",
+    "_No known traps yet._",
+})
+
+
 def _append_md_block(path: Path, block: str) -> None:
     """Append a `## ` block to a singleton markdown file (open-questions/known-traps).
 
@@ -1843,12 +1957,22 @@ def _append_md_block(path: Path, block: str) -> None:
     """
     text = path.read_text(encoding="utf-8") if path.exists() else ""
     kept = [
-        ln
-        for ln in text.splitlines()
-        if not (ln.strip().startswith("_No ") and ln.strip().endswith("yet._"))
+        ln for ln in text.splitlines() if ln.strip() not in _TEMPLATE_PLACEHOLDER_LINES
     ]
     head = "\n".join(kept).rstrip()
-    path.write_text((head + "\n\n" if head else "") + block.rstrip() + "\n", encoding="utf-8")
+    write_text_atomic(path, (head + "\n\n" if head else "") + block.rstrip() + "\n")
+
+
+def _sanitize_note_text(value) -> str:
+    """Flatten note text/field values to one safe line (review #3 R22).
+
+    Notes render as headings and `- key: value` lines inside singleton files, so
+    an embedded newline would forge structure (`\\n## …` injects a heading) and a
+    literal `<!--` / `-->` pair across two blocks comment-joins everything between
+    them out of every reader. Collapse whitespace and neutralize comment markers.
+    """
+    flat = " ".join(str(value).split())
+    return flat.replace("<!--", "< !--").replace("-->", "-- >")
 
 
 def _question_block(text: str, *, why=None, needs=None, status="open") -> str:
@@ -1878,6 +2002,36 @@ def _trap_block(summary: str, *, slug=None, area=None, symptom=None, why=None,
     return "\n".join(lines)
 
 
+# Machine-readable trap-token index consumed by the PreToolUse hook's cheap risk
+# pre-filter (review #3 R9). Lives under generated/ (rebuilt on every reindex,
+# never canonical, skipped by the secret scan like the rest of generated/).
+GUARD_PREFILTER_FILENAME = "guard-prefilter.json"
+
+
+def _build_guard_prefilter(memory_dir: Path) -> dict:
+    """Specific tokens + path tokens from traps and do-not-retry attempts.
+
+    This is what lets `crumb hook guard` escalate a trap-shaped but
+    routine-looking command (`pytest -n auto`) to full guard scoring without
+    hardcoding any particular trap in a regex and without record I/O on the
+    common hook path — the near-miss class that motivated hooks in review #1.
+    """
+    tokens: set[str] = set()
+    paths: set[str] = set()
+    for trap in load_traps(memory_dir):
+        text = trap["heading"] + "\n" + (trap.get("body") or "")
+        tokens |= _specific(text)
+        paths |= _paths_from_text(text)
+    for rec in active_attempts(memory_dir):
+        if _attempt_has_do_not_retry(rec):
+            text = (rec.meta.get("title") or "") + "\n" + rec.sections.get(
+                "Do Not Retry Unless", ""
+            )
+            tokens |= _specific(text)
+            paths |= _paths_from_text(text)
+    return {"tokens": sorted(tokens), "paths": sorted(paths)}
+
+
 def reindex_projections(memory_dir: Path, project_root: Path | None = None) -> bool:
     """Rebuild the generated/ projections from the canonical records (review F2).
 
@@ -1898,8 +2052,13 @@ def reindex_projections(memory_dir: Path, project_root: Path | None = None) -> b
         packet = build_resume_packet(memory_dir, project_root, stale_days=STALE_AGE_DAYS)
         gen = memory_dir / "generated"
         gen.mkdir(parents=True, exist_ok=True)
-        (gen / "resume-packet.md").write_text(
-            render_packet_markdown(packet), encoding="utf-8"
+        write_text_atomic(gen / "resume-packet.md", render_packet_markdown(packet))
+        # Guard pre-filter index (review #3 R9): a token/path index over traps and
+        # do-not-retry attempts, so the PreToolUse hook can spot trap-shaped
+        # *routine* commands with one small-file read instead of walking records.
+        write_text_atomic(
+            gen / GUARD_PREFILTER_FILENAME,
+            json.dumps(_build_guard_prefilter(memory_dir), indent=0, sort_keys=True) + "\n",
         )
         return True
     except Exception:  # pragma: no cover - defensive; never block a write on a projection
@@ -1931,9 +2090,20 @@ def note(
     text = text.strip()
     if not text:
         return {"ok": False, "error": "note text must not be empty"}
+    if kind in ("question", "trap"):
+        # question/trap render as single-line headings + `- key: value` lines in
+        # a shared singleton file, so text and field values are flattened and
+        # comment-marker-neutralized before they touch the file (review #3 R22).
+        text = _sanitize_note_text(text)
+        fields = {
+            k: (_sanitize_note_text(v) if isinstance(v, str) else v)
+            for k, v in fields.items()
+        }
 
     if kind == "question":
         path = memory_dir / "open-questions.md"
+        if any(q["question"] == text for q in load_open_questions(memory_dir)):
+            return {"ok": False, "error": f"question already recorded: {text!r}"}
         before = path.read_text(encoding="utf-8") if path.exists() else ""
         _append_md_block(
             path,
@@ -1941,23 +2111,31 @@ def note(
                             status=fields.get("status")),
         )
         if not any(q["question"] == text for q in load_open_questions(memory_dir)):
-            path.write_text(before, encoding="utf-8")  # revert
+            write_text_atomic(path, before)  # revert
             return {"ok": False, "error": "appended question did not parse back; reverted"}
         result = {"ok": True, "kind": "question", "ref": text, "path": str(path)}
 
     elif kind == "trap":
         path = memory_dir / "known-traps.md"
-        before = path.read_text(encoding="utf-8") if path.exists() else ""
         slug = fields.get("slug") or slugify(text)
+        marker = f"trap_{slug}:".lower()
+        # A duplicate heading would shadow the earlier block in every dict-based
+        # reader, leaving its body unreachable (review #3 R22) — refuse instead.
+        if any(b["heading"].lower().startswith(marker) for b in load_traps(memory_dir)):
+            return {
+                "ok": False,
+                "error": f"trap trap_{slug} already exists; pass a distinct slug "
+                "(--slug / fields.slug) to record a separate trap",
+            }
+        before = path.read_text(encoding="utf-8") if path.exists() else ""
         _append_md_block(
             path,
             _trap_block(text, slug=slug, area=fields.get("area"),
                         symptom=fields.get("symptom"), why=fields.get("why"),
                         safe=fields.get("safe"), verify=fields.get("verify")),
         )
-        marker = f"trap_{slug}:".lower()
         if not any(b["heading"].lower().startswith(marker) for b in load_traps(memory_dir)):
-            path.write_text(before, encoding="utf-8")  # revert
+            write_text_atomic(path, before)  # revert
             return {"ok": False, "error": "appended trap did not parse back; reverted"}
         result = {"ok": True, "kind": "trap", "ref": f"trap_{slug}", "path": str(path)}
 
@@ -2156,13 +2334,47 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---- mark-status (review #3 R25) ------------------------------------------- #
+
+def cmd_mark_status(args: argparse.Namespace) -> int:
+    """CLI surface over `set_record_status` (already exposed via MCP).
+
+    README/docs described marking records `disputed`/`stale`/`superseded`, but
+    the only writer was the MCP tool — closing that gap gives the plain-file
+    workflow the same lifecycle mutation (review #3 R25).
+    """
+    root = resolve_root(args.project)
+    memory_dir = root / MEMORY_DIRNAME
+    if not memory_dir.is_dir():
+        _emit_error(args, f"no {MEMORY_DIRNAME}/ found at {root}. Run `crumb init` first.")
+        return 2
+
+    result = set_record_status(
+        memory_dir,
+        args.record_id,
+        args.new_status,
+        args.reason or "",
+        agent=getattr(args, "agent", "human"),
+        superseded_by=args.superseded_by,
+    )
+    if not result.get("ok"):
+        _emit_error(args, result.get("error", "status change failed"))
+        return 1
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"Marked {result['id']}: {result['from']} -> {result['to']}")
+        print(f"  file: {result['path']}")
+    return 0
+
+
 # ---- capture session ------------------------------------------------------- #
 
 def _last_session_commit(memory_dir: Path) -> str | None:
     recs = load_records(memory_dir, types=("session",))
     if not recs:
         return None
-    recs = sorted(recs, key=lambda r: (r.meta.get("created_at") or "", r.stem))
+    recs = sorted(recs, key=lambda r: (_dt_sort_key(r.meta.get("created_at")), r.stem))
     commit = recs[-1].meta.get("commit")
     if commit in (None, "", NO_GIT_COMMIT):
         return None
@@ -2222,7 +2434,18 @@ def _git_prefill(root: Path, since: str | None) -> dict[str, str]:
         if rev_list:
             oldest = rev_list.splitlines()[-1]
             parent = _git_out(root, "rev-parse", "--verify", f"{oldest}^")
-            base = parent if parent else _GIT_EMPTY_TREE
+            if parent:
+                base = parent
+            elif _git_out(root, "rev-parse", "--is-shallow-repository") == "true":
+                # In a shallow clone the oldest visible commit is the shallow
+                # boundary, not the root — diffing from the empty tree would
+                # record the entire repo as "Files Touched" (review #3 R15).
+                # Diff from the boundary commit instead: bounded, slightly
+                # under-counting (its own changes are excluded) rather than
+                # wildly over-counting.
+                base = oldest
+            else:
+                base = _GIT_EMPTY_TREE
 
     shortstat = _git_out(root, "diff", "--shortstat", base, "HEAD") if base else None
 
@@ -2344,15 +2567,18 @@ HANDOFF_SECTIONS = [
 CURRENT_SECTIONS = ["Current Focus", "Recently Changed", "Watch Out For"]
 
 
-def split_md_sections(text: str) -> dict[str, str]:
-    """Split a plain-markdown file (no frontmatter) into {heading: content} on `## `.
+def split_md_ordered(text: str) -> tuple[list[str], list[tuple[str, str]]]:
+    """Fence-aware split into (preamble_lines, [(heading, content), …]) on `## `.
 
-    Fence-aware (review #3 R4): a `## ` line inside a ``` / ~~~ code fence is
-    content, not a section boundary — otherwise a handoff whose Verification
-    Commands section contains fenced expected output is torn apart on the next
-    capture (unterminated fence, managed headings injected inside it).
+    Preserves everything `split_md_sections`'s dict view cannot: the lines before
+    the first heading (preamble) and duplicate headings as separate entries
+    (review #3 R14). Fence-aware (review #3 R4): a `## ` line inside a ``` / ~~~
+    code fence is content, not a section boundary — otherwise a handoff whose
+    Verification Commands section contains fenced expected output is torn apart
+    on the next capture (unterminated fence, managed headings injected inside it).
     """
-    sections: dict[str, str] = {}
+    preamble: list[str] = []
+    ordered: list[tuple[str, str]] = []
     current: str | None = None
     buf: list[str] = []
     fence: str | None = None  # the opening fence marker, e.g. "```" or "~~~~"
@@ -2363,22 +2589,37 @@ def split_md_sections(text: str) -> dict[str, str]:
             # same character and at least the opening length ends it.
             if fm and fm.group(1)[0] == fence[0] and len(fm.group(1)) >= len(fence):
                 fence = None
-            if current is not None:
-                buf.append(line)
+            (buf if current is not None else preamble).append(line)
             continue
         m = re.match(r"^##\s+(.*)$", line)
         if m:
             if current is not None:
-                sections[current] = "\n".join(buf).strip()
+                ordered.append((current, "\n".join(buf).strip()))
             current = m.group(1).strip()
             buf = []
             continue
         if fm:
             fence = fm.group(1)
-        if current is not None:
-            buf.append(line)
+        (buf if current is not None else preamble).append(line)
     if current is not None:
-        sections[current] = "\n".join(buf).strip()
+        ordered.append((current, "\n".join(buf).strip()))
+    return preamble, ordered
+
+
+def split_md_sections(text: str) -> dict[str, str]:
+    """Split a plain-markdown file (no frontmatter) into {heading: content} on `## `.
+
+    Fence-aware (review #3 R4). Duplicate headings are merged (bodies joined)
+    rather than last-wins, so no body silently disappears from the dict view
+    (review #3 R14).
+    """
+    sections: dict[str, str] = {}
+    for heading, content in split_md_ordered(text)[1]:
+        if heading in sections and content:
+            existing = sections[heading]
+            sections[heading] = (existing + "\n\n" + content).strip() if existing else content
+        elif heading not in sections:
+            sections[heading] = content
     return sections
 
 
@@ -2400,11 +2641,25 @@ def _is_placeholder(text: str) -> bool:
     return False
 
 
+# Preamble lines the updaters themselves (re)generate — everything else found
+# before the first `## ` is user content and must survive a rewrite (review #3 R14).
+_MANAGED_PREAMBLE_RE = re.compile(
+    r"^(#\s|_Last updated:|_Branch:|_Commit:|_What matters right now\.)"
+)
+
+
+def _user_preamble(preamble: list[str]) -> list[str]:
+    """User-authored intro lines from a managed file's preamble (may be empty)."""
+    kept = [ln for ln in preamble if ln.strip() and not _MANAGED_PREAMBLE_RE.match(ln)]
+    return kept
+
+
 def update_handoff(
     memory_dir: Path, branch: str, commit: str, focus: str, next_action: str
 ) -> None:
     path = Path(memory_dir) / "handoff.md"
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    preamble, ordered = split_md_ordered(existing)
     sec = split_md_sections(existing)
     focus = "" if _is_placeholder(focus) else focus
     next_action = "" if _is_placeholder(next_action) else next_action
@@ -2419,22 +2674,30 @@ def update_handoff(
         f"_Commit: {commit}_",
         "",
     ]
+    intro = _user_preamble(preamble)
+    if intro:
+        out += intro + [""]
     for heading in HANDOFF_SECTIONS:
         out.append(f"## {heading}")
         content = sec.get(heading, "")
         out.append("" if _is_placeholder(content) else content)
         out.append("")
     # Preserve any user-added sections that aren't part of the managed layout
-    # rather than silently dropping them on every capture.
-    for heading, content in sec.items():
-        if heading not in HANDOFF_SECTIONS and not _is_placeholder(content):
+    # rather than silently dropping them on every capture. `sec` merges duplicate
+    # headings, so no body is lost; `ordered` supplies first-seen order.
+    emitted: set[str] = set(HANDOFF_SECTIONS)
+    for heading, _content in ordered:
+        content = sec.get(heading, "")
+        if heading not in emitted and not _is_placeholder(content):
             out += [f"## {heading}", content, ""]
-    path.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
+        emitted.add(heading)
+    write_text_atomic(path, "\n".join(out).rstrip() + "\n")
 
 
 def update_current(memory_dir: Path, focus: str, recently: str) -> None:
     path = Path(memory_dir) / "current.md"
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    preamble, ordered = split_md_ordered(existing)
     sec = split_md_sections(existing)
     focus = "" if _is_placeholder(focus) else focus
     recently = "" if _is_placeholder(recently) else recently
@@ -2449,16 +2712,22 @@ def update_current(memory_dir: Path, focus: str, recently: str) -> None:
         "_What matters right now. Lifespan: days to ~2 weeks. Keep it short and true._",
         "",
     ]
+    intro = _user_preamble(preamble)
+    if intro:
+        out += intro + [""]
     for heading in CURRENT_SECTIONS:
         out.append(f"## {heading}")
         content = vals[heading]
         out.append("" if _is_placeholder(content) else content)
         out.append("")
     # Preserve any user-added sections that aren't part of the managed layout.
-    for heading, content in sec.items():
-        if heading not in CURRENT_SECTIONS and not _is_placeholder(content):
+    emitted = set(CURRENT_SECTIONS)
+    for heading, _content in ordered:
+        content = sec.get(heading, "")
+        if heading not in emitted and not _is_placeholder(content):
             out += [f"## {heading}", content, ""]
-    path.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
+        emitted.add(heading)
+    write_text_atomic(path, "\n".join(out).rstrip() + "\n")
 
 
 # --------------------------------------------------------------------------- #
@@ -2495,11 +2764,16 @@ SECTION_CAPS = {
     "likely_files": 20,
     "verification": 12,
     "verifications": 12,
+    # Warnings are capped too (review #3 R8): every aged decision/question emits
+    # a warning, so a neglected store could blow the token bound through the one
+    # section the trimmer never touched.
+    "warnings": 20,
 }
 
 # Order in which sections give up items when the packet is over budget
 # (first listed = trimmed first = least load-bearing). Project / Current Focus /
-# Next Action / Stale warnings are never trimmed.
+# Next Action are never trimmed; warnings are trimmed only after every
+# substantive section is empty, so the hard token bound holds (review #3 R8).
 TRIM_ORDER = [
     "verification",
     "likely_files",
@@ -2508,6 +2782,7 @@ TRIM_ORDER = [
     "known_traps",
     "failed_attempts",
     "active_decisions",
+    "warnings",
 ]
 
 
@@ -2541,6 +2816,22 @@ def _age_days(value: str | None) -> int | None:
     return (now - dt).days
 
 
+def _dt_sort_key(value: str | None) -> float:
+    """Chronologically comparable key for an ISO timestamp string (review #3 R23).
+
+    Lexicographic sort breaks on heterogeneous UTC offsets (`now_iso()` embeds
+    the *local* offset, so DST or a machine move makes '2026-07-01T01:00+02:00'
+    sort after '2026-07-01T00:30+00:00' despite being earlier). Unparseable or
+    missing timestamps sort oldest.
+    """
+    dt = _parse_iso(value)
+    if dt is None:
+        return float("-inf")
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return dt.timestamp()
+
+
 def git_commit_distance(root: Path, commit: str | None) -> int | None:
     """Commits between `commit` and HEAD (`rev-list --count commit..HEAD`).
 
@@ -2561,12 +2852,12 @@ def git_commit_distance(root: Path, commit: str | None) -> int | None:
 # ---- section accessors (reused by Phase 5 guard) --------------------------- #
 
 def _by_recency(records: list[Record]) -> list[Record]:
-    """Newest first, by updated_at then created_at then stem."""
+    """Newest first, by updated_at then created_at then stem (parsed, not lexicographic)."""
     return sorted(
         records,
         key=lambda r: (
-            r.meta.get("updated_at") or "",
-            r.meta.get("created_at") or "",
+            _dt_sort_key(r.meta.get("updated_at")),
+            _dt_sort_key(r.meta.get("created_at")),
             r.stem,
         ),
         reverse=True,
@@ -2646,18 +2937,25 @@ def load_open_questions(memory_dir: Path) -> list[dict]:
 
 
 def parse_handoff_meta(text: str) -> dict:
-    """Pull branch / commit / updated_at from the handoff header lines."""
+    """Pull branch / commit / updated_at from the handoff header lines.
+
+    Template placeholder values (`<branch>`, `<YYYY-MM-DDTHH:mm:ssZ>`, …) are
+    treated as absent (review #3 R19): a store that has never been captured must
+    not warn "branch mismatch: handoff was written on '<branch>'" or "handoff
+    timestamp is not parseable" on every resume/guard/audit until first capture.
+    """
     meta: dict = {}
     for line in text.splitlines():
-        m = re.match(r"_Last updated:\s*(.+?)_\s*$", line)
-        if m:
-            meta["updated_at"] = m.group(1).strip()
-        m = re.match(r"_Branch:\s*(.+?)_\s*$", line)
-        if m:
-            meta["branch"] = m.group(1).strip()
-        m = re.match(r"_Commit:\s*(.+?)_\s*$", line)
-        if m:
-            meta["commit"] = m.group(1).strip()
+        for key, pattern in (
+            ("updated_at", r"_Last updated:\s*(.+?)_\s*$"),
+            ("branch", r"_Branch:\s*(.+?)_\s*$"),
+            ("commit", r"_Commit:\s*(.+?)_\s*$"),
+        ):
+            m = re.match(pattern, line)
+            if m:
+                val = m.group(1).strip()
+                if not _is_placeholder(val):
+                    meta[key] = val
     return meta
 
 
@@ -2811,7 +3109,11 @@ def compute_staleness(
 def _inputs_hash(memory_dir: Path) -> str:
     """Short content hash of the canonical inputs (so audit/Phase 6 can spot drift)."""
     h = hashlib.sha256()
+    # manifest.yml is a packet input (project name, policies), so it is part of
+    # the hash — otherwise the freshness check certifies a packet built from a
+    # since-edited manifest (review #3 R7).
     paths = [Path(memory_dir) / f for f in CORE_FILES]
+    paths.append(Path(memory_dir) / "manifest.yml")
     for d in DIR_TYPES:
         dd = Path(memory_dir) / d
         if dd.is_dir():
@@ -3007,15 +3309,19 @@ def _bound_packet(packet: dict, *, fast: bool) -> None:
             packet[key] = []
         packet["omitted"] = {}
         packet["omitted_reason"] = {}
-        return
 
-    # Per-section caps (record how many we hid, and why).
+    # Per-section caps (record how many we hid, and why). Applied in --fast mode
+    # too: warnings survive the fast prune and must stay bounded (review #3 R8).
     for key, cap in SECTION_CAPS.items():
+        if fast and key in _FAST_DROP:
+            continue
         items = packet.get(key, [])
         if len(items) > cap:
             packet["omitted"][key] = packet["omitted"].get(key, 0) + (len(items) - cap)
             packet["omitted_reason"][key] = "the per-section cap"
             packet[key] = items[:cap]
+    if fast:
+        return
 
     # Budget trim, lowest-priority section first, until within the ceiling.
     while approx_tokens(render_packet_markdown(packet)) > TOKEN_BUDGET_MAX:
@@ -3149,6 +3455,7 @@ def render_packet_markdown(packet: dict) -> str:
         out += [f"- {w}" for w in packet["warnings"]]
     else:
         out.append("_(no computed staleness or risk signals)_")
+    out += _omitted_note(packet, "warnings")
     out.append("")
 
     return "\n".join(out).rstrip() + "\n"
@@ -3956,7 +4263,11 @@ SECRET_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
         "secret-assignment",
         re.compile(
             r"(?i)\b(?:api[_-]?key|secret(?:[_-]?key)?|access[_-]?token|auth[_-]?token|"
-            r"client[_-]?secret|password|passwd|pwd)\b\s*[:=]\s*"
+            r"refresh[_-]?token|id[_-]?token|session[_-]?token|private[_-]?key|"
+            r"signing[_-]?key|client[_-]?secret|password|passwd|pwd)\b"
+            # allow a closing quote on the label so JSON keys ("private_key":)
+            # match too — the scan now covers .json files (review #3 R26)
+            r"['\"]?\s*[:=]\s*"
             r"['\"]?([A-Za-z0-9/+_\-]{16,})['\"]?"
         ),
     ),
@@ -3984,23 +4295,31 @@ _HIGH_ENTROPY_TOKEN = re.compile(r"\b[A-Za-z0-9+/=]{32,}\b")
 
 # Override-style phrasing audit flags for human review (plan §16 note). A *flag*,
 # never a gate — same content-as-data posture as guard (Fixture 7).
+# A short run of qualifiers between the verb and its object, so natural phrasings
+# ("ignore failing tests", "ignore all prior instructions", "skip the flaky
+# suite's checks") are caught, not just the bare determiner forms (review #3 R26).
+_IL_QUALIFIERS = r"(?:(?:all|the|any|every|these|those|prior|previous|earlier|existing|above|failing|flaky|broken|remaining|other)\s+){0,3}"
+
 INSTRUCTION_LIKE_PATTERNS: tuple["re.Pattern[str]", ...] = (
     re.compile(
-        r"(?i)\bignore\s+(?:all\s+|the\s+|any\s+)?"
-        r"(?:tests?|instructions?|previous|above|rules?|warnings?|memory|checks?)\b"
+        r"(?i)\bignore\s+" + _IL_QUALIFIERS +
+        r"(?:tests?|instructions?|previous|above|rules?|warnings?|memory|checks?|errors?|failures?)\b"
     ),
     re.compile(
-        r"(?i)\bskip\s+(?:the\s+|all\s+)?"
+        r"(?i)\bskip\s+" + _IL_QUALIFIERS +
         r"(?:tests?|validation|verification|checks?|review|ci)\b"
     ),
     re.compile(
-        r"(?i)\bdisable\s+(?:the\s+)?"
+        r"(?i)\bdisable\s+" + _IL_QUALIFIERS +
         r"(?:tests?|checks?|validation|guard|safety|linter?|ci)\b"
     ),
     re.compile(r"(?i)\b(?:never|always)\s+run\b"),
     re.compile(r"(?i)\bdo\s+not\s+run\b"),
     re.compile(r"(?i)\b(?:always|never)\s+(?:force[- ]?push|skip|disable|ignore|bypass)\b"),
-    re.compile(r"(?i)\bbypass\s+(?:the\s+)?(?:tests?|checks?|review|validation|guard)\b"),
+    re.compile(
+        r"(?i)\bbypass\s+" + _IL_QUALIFIERS +
+        r"(?:tests?|checks?|(?:code\s+)?review|validation|guard|ci)\b"
+    ),
 )
 
 # Bloat thresholds (heuristic).
@@ -4100,10 +4419,18 @@ def _looks_high_entropy(tok: str) -> bool:
     return _shannon_entropy(tok) >= 3.5
 
 
+# Text-file suffixes the secret scan covers. A `.yaml`/`.json`/`.txt` dropped
+# under memory was previously never scanned (review #3 R26).
+_SECRET_SCAN_GLOBS = ("*.md", "*.yml", "*.yaml", "*.json", "*.txt")
+
+
 def _iter_committed_memory_files(memory_dir: Path):
     """Yield committed-memory text files (skips private/index/generated subtrees)."""
     memory_dir = Path(memory_dir)
-    for p in sorted(memory_dir.rglob("*.md")) + sorted(memory_dir.rglob("*.yml")):
+    paths: list[Path] = []
+    for pattern in _SECRET_SCAN_GLOBS:
+        paths.extend(memory_dir.rglob(pattern))
+    for p in sorted(set(paths)):
         rel_parts = p.relative_to(memory_dir).parts
         if rel_parts and rel_parts[0] in _SECRET_SKIP_DIRS:
             continue
@@ -4202,7 +4529,10 @@ def detect_packet_drift(memory_dir: Path) -> list[dict]:
     for p in sorted(gen.glob("*.md")):
         if p.name == "README.md":
             continue
-        text = p.read_text(encoding="utf-8")
+        try:
+            text = p.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue  # undecodable projection — validate 16.12 reports it (review #3 R16)
         stamped = _stamped_inputs_hash(text)
         if stamped is None:
             continue  # an un-stamped projection (older format) — nothing to compare
@@ -4338,7 +4668,12 @@ def run_audit(memory_dir: Path, root: Path, *, stale_days: int = STALE_AGE_DAYS)
         load_open_questions(memory_dir),
         stale_days,
     ):
-        findings.append(_audit_finding("staleness", AUDIT_WARN, "handoff.md", w))
+        # The handoff age/distance line is emitted unconditionally; it is only a
+        # *warning* when compute_staleness marked it cold (⚠). "handoff is 0
+        # day(s) old, written 0 commit(s) behind" on a seconds-old store is
+        # health context, not a problem (review #3 R20).
+        sev = AUDIT_INFO if (w.startswith("handoff is") and not w.startswith("⚠")) else AUDIT_WARN
+        findings.append(_audit_finding("staleness", sev, "handoff.md", w))
 
     # A (cont). Re-surface the validate-failing health conditions for the health view
     # (missing evidence, invalid status, private-path violation, id/frontmatter
@@ -4549,6 +4884,11 @@ def _mcp_sdk_available() -> bool:
 def cmd_mcp(args: argparse.Namespace) -> int:
     what = getattr(args, "mcp_what", None)
     if what == "serve":
+        # `--project` must actually target the server at that project — it was
+        # accepted and silently ignored, so reads AND writes went to cwd's store
+        # (review #3 R12). The server resolves $BREADCRUMBS_PROJECT.
+        if getattr(args, "project", None):
+            os.environ["BREADCRUMBS_PROJECT"] = str(resolve_root(args.project))
         # Lazy import keeps `crumb` stdlib-only; the server degrades with a clear
         # hint when the [mcp] extra is missing.
         from breadcrumbs import mcp_server
@@ -4953,9 +5293,12 @@ def _read_hook_stdin() -> dict:
     except OSError:
         return {}
     try:
-        return json.loads(raw) if raw.strip() else {}
+        payload = json.loads(raw) if raw.strip() else {}
     except json.JSONDecodeError:
         return {}
+    # Valid JSON that isn't an object (a list, a string) is as useless to the
+    # hook as malformed JSON — treat it the same (review #3 R13).
+    return payload if isinstance(payload, dict) else {}
 
 
 def _hook_root(payload: dict) -> Path:
@@ -4967,10 +5310,37 @@ def _hook_root(payload: dict) -> Path:
 # Cheap risk patterns the keyword classifier misses (destructive shell/git ops).
 # Used only to decide whether to escalate to full guard — a pure regex scan of a
 # short string, no record I/O, so the common path stays well inside the hook budget.
+# Store-specific trap shapes are NOT hardcoded here — they come from the
+# generated/ trap-token index below (review #3 R9).
 _HOOK_RISK_RE = re.compile(
     r"(?i)(--force\b|force-push|push\s+-f\b|reset\s+--hard|rm\s+-rf|git\s+clean|"
-    r"gradlew\s+--stop|--stop\b|drop\s+table|truncate\b|--no-verify|branch\s+-D\b)"
+    r"--stop\b|drop\s+table|truncate\b|--no-verify|branch\s+-D\b)"
 )
+
+
+def _prefilter_trap_hit(memory_dir: Path, action: str, files: list[str] | None) -> bool:
+    """Does the action overlap the reindex-time trap-token index? (review #3 R9)
+
+    One small generated-file read — no record walk — keeping the pre-filter's
+    "cheap on the common path" promise while closing the near-miss class where a
+    routine-looking command (`pytest -n auto`) matches a recorded trap that the
+    keyword classifier and the destructive-op regex are both blind to. Absent or
+    unreadable index ⇒ not risky (the index is rebuilt on every reindex).
+    """
+    p = memory_dir / "generated" / GUARD_PREFILTER_FILENAME
+    try:
+        idx = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(idx, dict):
+        return False
+    # Two specific shared tokens, mirroring the guard anti-noise floor — a single
+    # generic word never escalates (§19b.8).
+    if len(_specific(action) & set(idx.get("tokens") or ())) >= GUARD_MIN_KEYWORD_OVERLAP:
+        return True
+    action_paths = _norm_files(_paths_from_text(action)) | _norm_files(files or [])
+    index_paths = _norm_files(idx.get("paths") or ())
+    return bool(action_paths & index_paths)
 
 
 def _hook_action_from_tool(tool: str, tool_input: dict) -> tuple[str, list[str] | None]:
@@ -5013,14 +5383,25 @@ def _hook_guard(memory_dir: Path, root: Path, payload: dict) -> int:
     if not memory_dir.is_dir():
         print(json.dumps({}))
         return 0
-    action, files = _hook_action_from_tool(payload.get("tool_name") or "", payload.get("tool_input") or {})
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        # A truthy non-dict tool_input crashed with a raw traceback where every
+        # other malformed-payload path degrades to {} (review #3 R13).
+        tool_input = {}
+    action, files = _hook_action_from_tool(payload.get("tool_name") or "", tool_input)
     if not action:
         print(json.dumps({}))
         return 0
-    # Cost-aware pre-filter: pure-string classify + risk regex (no record I/O) on the
-    # common path. Only a plausibly-risky action escalates to full guard scoring.
+    # Cost-aware pre-filter: pure-string classify + risk regex on the common
+    # path, plus one read of the reindex-time trap-token index (review #3 R9) so
+    # trap-shaped routine commands escalate too. Only a plausibly-risky action
+    # escalates to full guard scoring.
     _primary, classes = classify_action(action)
-    risky = classes != ["routine_edit"] or bool(_HOOK_RISK_RE.search(action))
+    risky = (
+        classes != ["routine_edit"]
+        or bool(_HOOK_RISK_RE.search(action))
+        or _prefilter_trap_hit(memory_dir, action, files)
+    )
     if not risky:
         print(json.dumps({}))
         return 0
@@ -5334,6 +5715,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_verify.add_argument("--confidence", choices=("low", "medium", "high"))
     p_verify.add_argument("--agent", default="human", help="record author label (default: human)")
     p_verify.set_defaults(func=cmd_verify)
+
+    # mark-status (review #3 R25) — record lifecycle mutation from the CLI
+    p_mark = sub.add_parser(
+        "mark-status",
+        parents=[global_parser],
+        help="change a record's status (stale/disputed/superseded/…), validate-gated",
+    )
+    p_mark.add_argument("record_id", metavar="ID", help="record id, e.g. dec_20260510_markdown-source-of-truth")
+    p_mark.add_argument("new_status", metavar="STATUS", choices=VALID_STATUS,
+                        help=f"new status ({', '.join(VALID_STATUS)})")
+    p_mark.add_argument("--reason", default="",
+                        help="why the status changed (recorded as a trailing comment)")
+    p_mark.add_argument("--superseded-by", dest="superseded_by", default=None, metavar="ID",
+                        help="the replacing record's id (required by validate when "
+                             "marking superseded)")
+    p_mark.add_argument("--agent", default="human", help="author label (default: human)")
+    p_mark.set_defaults(func=cmd_mark_status)
 
     # reindex (review F2) — explicit projection refresh (mutations reindex automatically)
     p_reindex = sub.add_parser(

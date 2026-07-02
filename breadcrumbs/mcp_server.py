@@ -241,9 +241,17 @@ def build_server():  # -> FastMCP
         return mcp_core.tool_note(kind, text, fields=fields, tags=tags, root=_root())
 
     @mcp.tool()
-    def memory_mark_status(id: str, status: str, reason: str) -> dict:
-        """Change a record's status, validate-gated (wraps `set_record_status`)."""
-        return mcp_core.tool_mark_status(id, status, reason, root=_root())
+    def memory_mark_status(
+        id: str, status: str, reason: str, superseded_by: str | None = None
+    ) -> dict:
+        """Change a record's status, validate-gated (wraps `set_record_status`).
+
+        Pass `superseded_by` (the replacing record's id) when marking
+        `superseded` — validate rejects a superseded record without it.
+        """
+        return mcp_core.tool_mark_status(
+            id, status, reason, superseded_by=superseded_by, root=_root()
+        )
 
     @mcp.tool()
     def memory_verify(
@@ -283,6 +291,18 @@ def build_server():  # -> FastMCP
 
 def main(argv: list[str] | None = None) -> int:
     """Entry point for `python -m breadcrumbs.mcp_server` / `breadcrumbs-mcp`."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    if any(a in ("-h", "--help") for a in args):
+        # `breadcrumbs-mcp --help` used to silently start the stdio server and
+        # hang the terminal (review #3 R25) — print usage instead.
+        print(
+            "usage: breadcrumbs-mcp\n\n"
+            "Run the breadcrumbs MCP server over stdio (registered by `crumb mcp\n"
+            "register` / `crumb init --with-mcp`; run directly by an MCP client,\n"
+            "not by hand). Serves the project in $BREADCRUMBS_PROJECT, else cwd.\n"
+            'Requires the optional SDK:  pip install "crumb-kit[mcp]"'
+        )
+        return 0
     if FastMCP is None:
         sys.stderr.write(_INSTALL_HINT + "\n")
         return 1

@@ -177,7 +177,9 @@ def tool_search(
     if (missing := _memory_missing(mem)) is not None:
         return missing
     matches, _by_id = cli.search(mem, project_root, query, files=files, filters=filters or {})
-    return {"query": query, "filters": filters or {}, "count": len(matches), "matches": matches}
+    # `ok: True` on success so every tool shares one envelope (review #3 R25).
+    return {"ok": True, "query": query, "filters": filters or {},
+            "count": len(matches), "matches": matches}
 
 
 def tool_guard_before_action(
@@ -189,27 +191,26 @@ def tool_guard_before_action(
     project_root, mem = resolve(root)
     if (missing := _memory_missing(mem)) is not None:
         return missing
-    return cli.guard(mem, project_root, action, files=files)
+    return {"ok": True, **cli.guard(mem, project_root, action, files=files)}
 
 
 def tool_build_resume_packet(
     task: str | None = None,
-    fast: bool = False,
     root: str | Path | None = None,
 ) -> dict:
     """`memory_build_resume_packet` — wraps `cli.build_resume_packet`.
 
     Returns the structured packet (the same object the CLI renders to MD/JSON).
-    `task` is advisory context for the caller; the packet itself is task-agnostic
-    (the CLI behaves the same), so it is echoed back, not used to fork behavior.
+    `task` is passed through to the engine (review #3 R10), so the F4/F6 task
+    scoping — `requested_task` echoed, `likely_files` scoped to records that
+    actually match, `starting cold` label on an empty result — behaves exactly
+    as it does on `crumb resume --task`. No behavior fork.
     """
     project_root, mem = resolve(root)
     if (missing := _memory_missing(mem)) is not None:
         return missing
-    packet = cli.build_resume_packet(mem, project_root, fast=fast)
-    if task:
-        packet = {**packet, "requested_task": task}
-    return packet
+    packet = cli.build_resume_packet(mem, project_root, task=task or None)
+    return {"ok": True, **packet}
 
 
 def tool_validate(root: str | Path | None = None) -> dict:
@@ -228,7 +229,10 @@ def tool_scan_secrets(root: str | Path | None = None) -> dict:
     if (missing := _memory_missing(mem)) is not None:
         return missing
     findings = cli.scan_secrets(mem)
-    return {"clean": not findings, "count": len(findings), "findings": findings}
+    # `ok` mirrors memory_validate's semantics (safe ⇔ true); `clean` is kept for
+    # compatibility with existing consumers (review #3 R25).
+    return {"ok": not findings, "clean": not findings,
+            "count": len(findings), "findings": findings}
 
 
 def tool_record(
@@ -258,10 +262,20 @@ def tool_record(
     tags = payload.get("tags") or []
     confidence = payload.get("confidence")
 
-    # Evidence-or-low-confidence rule (validate §16.9) — enforced as the CLI does,
-    # non-interactively: no evidence ⇒ confidence is forced to low rather than failing.
+    # Evidence-or-low-confidence rule (validate §16.9), enforced exactly as the
+    # non-interactive CLI does (review #3 R11): an *unstated* confidence defaults
+    # to low when there is no evidence, but an explicit medium/high without
+    # evidence is an error — silently downgrading it would fork behavior on the
+    # flagship write tool and misrepresent the caller's stated confidence.
     if not evidence and confidence != "low":
-        confidence = "low"
+        if confidence is None:
+            confidence = "low"
+        else:
+            return {
+                "ok": False,
+                "error": f"a {type} needs evidence or low confidence (validate §16.9): "
+                "add payload.evidence or set payload.confidence to 'low'",
+            }
 
     path, meta = cli.write_record(
         mem,
@@ -368,14 +382,20 @@ def tool_mark_status(
     id: str,
     status: str,
     reason: str,
+    superseded_by: str | None = None,
     root: str | Path | None = None,
     agent: str = "agent",
 ) -> dict:
-    """`memory_mark_status` — wraps `cli.set_record_status` (validate-gated)."""
+    """`memory_mark_status` — wraps `cli.set_record_status` (validate-gated).
+
+    `superseded_by` points at the replacing record when marking `superseded`
+    (without it, validate §16.6 rejects and reverts the edit).
+    """
     _, mem = resolve(root)
     if (missing := _memory_missing(mem)) is not None:
         return missing
-    return cli.set_record_status(mem, id, status, reason, agent=agent)
+    return cli.set_record_status(mem, id, status, reason, agent=agent,
+                                 superseded_by=superseded_by)
 
 
 # --------------------------------------------------------------------------- #

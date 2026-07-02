@@ -104,6 +104,7 @@ crumb validate                   # deterministically check the store (schema + i
 crumb schema                     # print the record contract (sections, vocab, rules)
 crumb remember decision          # capture a durable choice
 crumb verify "finding#1" --status fixed   # record a verification result (a finding about reality)
+crumb mark-status "dec_…" stale --reason "superseded by reality"   # record lifecycle mutation
 crumb note question|trap|idea    # leave a note for the next agent (no hand-editing)
 crumb capture session            # record session end (git-prefilled); updates handoff + current
 crumb resume                     # print a bounded resume packet with computed staleness
@@ -415,6 +416,7 @@ automatically so it stays in step.)
 | `validate` | implemented (Phase 2) |
 | `remember decision` / `remember attempt` | implemented (Phase 3) |
 | `verify` (verification result: outcome + method + evidence) | implemented |
+| `mark-status` (record lifecycle mutation, validate-gated, `--superseded-by`) | implemented |
 | `reindex` (rebuild generated projections) | implemented |
 | `capture session` (incl. `--fast`) | implemented (Phase 3) |
 | `resume` (incl. `--fast`, computed staleness) | implemented (Phase 4 — **MVP-core**) |
